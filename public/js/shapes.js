@@ -3,9 +3,18 @@ import * as G from './geom.js';
 import { textLocal } from './raster.js';
 
 // Variable text: {serial}, {serial:4} (zero-padded), {date}, {time}, {year}, {month}, {day}
-export const textVars = { serial: 1 };
+// CSV merge: {csv:Column} (by header name) or {col:N} (1-based) from the current row of the loaded CSV.
+export const textVars = { serial: 1, csv: null, csvRow: 0 };
+function csvField(key) {
+  const c = textVars.csv; if (!c || !c.rows.length) return `{${key}}`;
+  const row = c.rows[Math.min(textVars.csvRow, c.rows.length - 1)] || [];
+  if (/^\d+$/.test(key)) return row[+key - 1] ?? '';
+  const i = c.headers.findIndex(h => h.trim().toLowerCase() === key.trim().toLowerCase());
+  return i < 0 ? `{csv:${key}}` : (row[i] ?? '');
+}
 export function resolveText(t) {
   if (!t || t.indexOf('{') < 0) return t;
+  t = t.replace(/\{csv:([^}]+)\}/g, (m, k) => csvField(k)).replace(/\{col:(\d+)\}/g, (m, k) => csvField(k));
   const d = new Date(), p2 = n => String(n).padStart(2, '0');
   return t.replace(/\{(serial)(?::(\d+))?\}|\{(date|time|year|month|day)\}/g, (m, ser, pad, k) => {
     if (ser) return String(textVars.serial).padStart(pad ? +pad : 0, '0');

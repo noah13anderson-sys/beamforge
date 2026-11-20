@@ -130,6 +130,29 @@ for (const t of ['grbl', 'smoothie', 'marlin']) {
     ok(`reflectTf matches true reflection at ${deg}°`, good);
   }
 }
+// --- overcut and lead-in
+{ const { leadAndOvercut } = await import(base + 'gcode.js');
+  const loop = [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]];
+  const oc = leadAndOvercut(loop, 0, 0, 3);
+  ok('overcut extends 3 mm past the start', oc.length === 6 && oc[5][0] === 3 && oc[5][1] === 0, JSON.stringify(oc.at(-1)));
+  const li = leadAndOvercut(loop, 0, 2, 0);
+  ok('lead-in starts outside a part', li[0][1] === -2 && li[0][0] === 0, JSON.stringify(li[0]));
+  const lh = leadAndOvercut(loop, 1, 2, 0);
+  ok('lead-in starts inside a hole', lh[0][1] === 2 && lh[0][0] === 0, JSON.stringify(lh[0]));
+  const g = job(D.makeDevice('grbl'), { ...L(), overcut: 2 }).gcode;
+  ok('overcut appears in G-code', (g.match(/^G1 /gm) || []).length === 5, String((g.match(/^G1 /gm) || []).length)); }
+// --- QR code
+{ const Q = await import(base + 'qr.js');
+  const q = Q.qrEncode('HELLO WORLD', { ecl: 'M' });
+  ok('QR version 1 for short text', q.version === 1 && q.size === 21);
+  ok('QR finder pattern', q.modules[0].slice(0, 7).every(Boolean) && q.modules[1][1] === false && q.modules[3][3] === true);
+  ok('QR long text picks a big version', Q.qrEncode('x'.repeat(500), { ecl: 'Q' }).version > 10);
+  ok('QR rects cover dark modules', Q.qrRects(q).reduce((a, r) => a + r[2], 0) === q.modules.flat().filter(Boolean).length); }
+// --- CSV merge text
+{ const Sh0 = await import(base + 'shapes.js');
+  Sh0.textVars.csv = { headers: ['Name', 'Club'], rows: [['Ana', 'Chess'], ['Bo', 'Robotics']] }; Sh0.textVars.csvRow = 1;
+  ok('CSV merge by column name and number', Sh0.resolveText('{csv:name} / {col:2}') === 'Bo / Robotics', Sh0.resolveText('{csv:name} / {col:2}'));
+  Sh0.textVars.csv = null; }
 // --- variable text resolve
 const Sh = await import(base + 'shapes.js');
 Sh.textVars.serial = 7;

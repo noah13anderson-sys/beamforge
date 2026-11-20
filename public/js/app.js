@@ -6,6 +6,7 @@ import { loadImage, getImage, imageSource, imageFilter, traceImage } from './ras
 import { offset as offsetPolys, boolean as booleanOp, joinPaths, fillet as filletPolys, reflectTf } from './ops.js';
 import { DEVICE_TYPES, ORIGINS, GRBL_SETTINGS, makeDevice, family, toMachine, mapToMachine, machineToDesign, rotaryScale, commands, screenToMachineDelta } from './devices.js';
 import { swizzle } from './ruida.js';
+import { qrEncode, qrRects } from './qr.js';
 import { Machine } from './machine.js';
 
 // ================================================================ utilities
@@ -78,6 +79,7 @@ const settings = loadSettings();
 function saveSettings() { try { localStorage.setItem('beamforge.settings', JSON.stringify(settings)); } catch { /* storage unavailable */ } }
 const dev = () => settings.devices.find(d => d.id === settings.deviceId) || settings.devices[0];
 textVars.serial = settings.serial;
+if (settings.csv) { textVars.csv = settings.csv; textVars.csvRow = settings.csvRow || 0; }
 
 // ================================================================ material library
 function loadLib() { try { return JSON.parse(localStorage.getItem('beamforge.materials') || '[]'); } catch { return []; } }
@@ -101,7 +103,7 @@ function layerDefaults(mode = 'line') {
     speed: mode === 'line' ? 10 : 120, power: mode === 'line' ? 80 : 35, minPower: 0, passes: 1,
     interval: 0.1, overscan: 2.5, bidir: true, angle: 0, crosshatch: false, air: mode === 'line',
     dither: 'floyd', threshold: 128, halftoneCell: 6, halftoneAngle: 45,
-    kerf: 0, tabs: false, tabCount: 4, tabSpacing: 0, tabWidth: 0.5, perf: false, perfCut: 2, perfSkip: 1,
+    kerf: 0, overcut: 0, leadIn: 0, tabs: false, tabCount: 4, tabSpacing: 0, tabWidth: 0.5, perf: false, perfCut: 2, perfSkip: 1,
     constant: false, zOffset: 0, zStep: 0, fillGroups: 'all',
   };
 }
@@ -1139,6 +1141,208 @@ function copyObjs(list, dx, dy) {
   });
 }
 
+// ================================================================ generators & production tools
+const hslHex = (h, s, l) => {
+  s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l);
+  const f = n => Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1)))).toString(16).padStart(2, '0');
+  return `#${f(0)}${f(8)}${f(4)}`;
+};
+
+// QR code as a filled path (dark modules welded into clean outlines), placed at the centre of the view.
+async function qrDialog() {
+  const Q = settings.qr || { text: 'https://example.com', size: 30, ecl: 'M', quiet: false };
+  const v = await formDialog('QR code', [
+    { key: 'text', label: 'Text or link', type: 'textarea', value: Q.text },
+    { key: 'size', label: 'Size (mm)', type: 'number', value: Q.size, min: 5 },
+    { key: 'ecl', label: 'Error correction', type: 'select', value: Q.ecl, options: [['L', 'Low (7%) — smallest'], ['M', 'Medium (15%)'], ['Q', 'Quartile (25%)'], ['H', 'High (30%) — survives damage']] },
+    { key: 'quiet', label: 'Add a quiet-zone border frame (helps scanning on busy material)', type: 'check', value: Q.quiet },
+    { key: 'n', type: 'note', label: 'The code goes on the active layer; use a Fill layer to engrave it. Variable text like {serial} is filled in now. Engrave dark modules on light material (or invert the material).' },
+  ], { ok: 'Create' });
+  if (!v || !v.text) return;
+  settings.qr = { text: v.text, size: v.size || 30, ecl: v.ecl, quiet: v.quiet }; saveSettings();
+  let q;
+  try { q = qrEncode(resolveText(v.text), { ecl: v.ecl }); } catch (e) { return msg(e.message, 'err'); }
+  const m = settings.qr.size / q.size, c = viewCentre();
+  const x0 = c[0] - settings.qr.size / 2, y0 = c[1] - settings.qr.size / 2;
+  const rects = qrRects(q).map(([x, y, w, h]) => [{ closed: true, pts: [[x0 + x * m, y0 + y * m], [x0 + (x + w) * m, y0 + y * m], [x0 + (x + w) * m, y0 + (y + h) * m], [x0 + x * m, y0 + (y + h) * m]] }]);
+  const polys = booleanOp('union', rects);
+  if (v.quiet) {
+    const z = 4 * m, t = Math.max(m / 2, 0.3);
+    polys.push(...booleanOp('difference', [[rectPoly(x0 - z - t, y0 - z - t, settings.qr.size + 2 * (z + t), settings.qr.size + 2 * (z + t))]], [[rectPoly(x0 - z, y0 - z, settings.qr.size + 2 * z, settings.qr.size + 2 * z)]]));
+  }
+  edit(() => { const o = pathFromWorld(polys, { name: `QR: ${v.text.slice(0, 30)}` }); S.sel = new Set([o.id]); });
+  msg(`QR code version ${q.version} (${q.size}×${q.size} modules, ${r3(m)} mm each)${m < 0.4 ? ' — modules are very small; make it bigger if it will not scan' : ''}`, m < 0.4 ? 'err' : 'ok');
+}
+const rectPoly = (x, y, w, h) => ({ closed: true, pts: [[x, y], [x + w, y], [x + w, y + h], [x, y + h]] });
+function viewCentre() {
+  const r = $('#cv').getBoundingClientRect();
+  try { return toWorld(r.width / 2, r.height / 2); } catch { return [dev().bedW / 2, dev().bedH / 2]; }
+}
+
+// Material test: a grid of squares, each on its own layer with its own speed/power, plus labels.
+async function materialTestDialog() {
+  const T = settings.mtest || { mode: 'fill', pMin: 10, pMax: 100, sMin: 50, sMax: 300, cols: 5, rows: 5, cell: 10, gap: 3, labels: true, lp: 20, ls: 150, passes: 1, interval: 0.1 };
+  const v = await formDialog('Material test', [
+    { key: 'mode', label: 'Test type', type: 'select', value: T.mode, options: [['fill', 'Fill (engraving)'], ['line', 'Line (cutting / scoring)']] },
+    { key: 'pMin', label: 'Power from (%)', type: 'number', value: T.pMin, min: 0, max: 100 },
+    { key: 'pMax', label: 'Power to (%)', type: 'number', value: T.pMax, min: 0, max: 100 },
+    { key: 'cols', label: 'Power steps (columns)', type: 'number', value: T.cols, min: 1, max: 12, step: 1 },
+    { key: 'sMin', label: 'Speed from (mm/s)', type: 'number', value: T.sMin, min: 0.1 },
+    { key: 'sMax', label: 'Speed to (mm/s)', type: 'number', value: T.sMax, min: 0.1 },
+    { key: 'rows', label: 'Speed steps (rows)', type: 'number', value: T.rows, min: 1, max: 12, step: 1 },
+    { key: 'passes', label: 'Passes', type: 'number', value: T.passes, min: 1, step: 1 },
+    { key: 'interval', label: 'Fill line interval (mm)', type: 'number', value: T.interval, min: 0.01 },
+    { key: 'cell', label: 'Square size (mm)', type: 'number', value: T.cell, min: 2 },
+    { key: 'gap', label: 'Gap between squares (mm)', type: 'number', value: T.gap, min: 0 },
+    { key: 'labels', label: 'Engrave labels (power across the top, speed down the side)', type: 'check', value: T.labels },
+    { key: 'lp', label: 'Label power (%)', type: 'number', value: T.lp, min: 0, max: 100 },
+    { key: 'ls', label: 'Label speed (mm/s)', type: 'number', value: T.ls, min: 0.1 },
+    { key: 'n', type: 'note', label: 'Adds one layer per square to this project (named with its settings), placed at the top-left of the bed. Frame it, run it, then pick the best square and save it to the Material library. Delete the test layers afterwards.' },
+  ], { ok: 'Create test', wide: true });
+  if (!v) return;
+  const cols = clamp(Math.round(v.cols) || 1, 1, 12), rows = clamp(Math.round(v.rows) || 1, 1, 12);
+  settings.mtest = { ...v, cols, rows }; saveSettings();
+  const lerp = (a, b, i, n) => n > 1 ? a + (b - a) * i / (n - 1) : a;
+  const cell = v.cell || 10, gap = v.gap ?? 3, ts = Math.max(1.5, Math.min(cell * 0.35, 5));
+  const left = 5 + (v.labels ? ts * 3.2 : 0), top = 5 + (v.labels ? ts * 2 : 0);
+  edit(() => {
+    const ids = [];
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+      const power = Math.round(lerp(v.pMin, v.pMax, c, cols)), speed = +lerp(v.sMin, v.sMax, r, rows).toFixed(1);
+      const L = { ...makeLayer(hslHex((r * cols + c) * 137.508 % 360, 65, 45), v.mode), name: `Test P${power}% S${speed}`, power, speed, passes: Math.max(1, Math.round(v.passes) || 1), interval: v.interval || 0.1, air: v.mode === 'line' };
+      S.layers.push(L);
+      ids.push(addObject({ type: 'rect', w: cell, h: cell, radius: 0, layer: L.id, name: L.name, tf: { x: left + c * (cell + gap) + cell / 2, y: top + r * (cell + gap) + cell / 2, sx: 1, sy: 1, r: 0 } }).id);
+    }
+    if (v.labels) {
+      const LL = { ...makeLayer('#404a57', 'fill'), name: 'Test labels', power: v.lp, speed: v.ls, interval: 0.1, air: false };
+      S.layers.push(LL);
+      const txt = (text, x, y) => ids.push(addObject({ type: 'text', text, font: 'sans-serif', size: ts, bold: true, italic: false, align: 'center', layer: LL.id, tf: { x, y, sx: 1, sy: 1, r: 0 } }).id);
+      for (let c = 0; c < cols; c++) txt(`${Math.round(lerp(v.pMin, v.pMax, c, cols))}`, left + c * (cell + gap) + cell / 2, top - ts * 0.9);
+      for (let r = 0; r < rows; r++) txt(`${+lerp(v.sMin, v.sMax, r, rows).toFixed(1)}`, left - ts * 1.7, top + r * (cell + gap) + cell / 2);
+      txt('%', left - ts * 1.7, top - ts * 0.9);
+    }
+    S.sel = new Set(ids);
+  });
+  msg(`Material test: ${rows * cols} squares (power ${v.pMin}→${v.pMax}% across, speed ${v.sMin}→${v.sMax} mm/s down)`, 'ok');
+}
+
+// Pack objects onto the bed in rows (bounding-box nesting). Groups stay together.
+async function packDialog() {
+  const objs = S.sel.size ? selected() : S.objects;
+  if (!objs.length) return msg('Nothing to pack');
+  const P = settings.pack || { gap: 3, margin: 5, rotate: true };
+  const v = await formDialog('Pack onto the bed', [
+    { key: 'gap', label: 'Gap between parts (mm)', type: 'number', value: P.gap, min: 0 },
+    { key: 'margin', label: 'Margin from the bed edge (mm)', type: 'number', value: P.margin, min: 0 },
+    { key: 'rotate', label: 'Turn tall parts on their side to save space', type: 'check', value: P.rotate },
+    { key: 'n', type: 'note', label: `${S.sel.size ? 'Packs the selected objects' : 'Nothing is selected, so this packs everything'} into rows from the top-left of the bed, tallest first. It uses each part's bounding box (fast, not true-shape nesting).` },
+  ], { ok: 'Pack' });
+  if (!v) return;
+  settings.pack = v; saveSettings();
+  const gap = v.gap || 0, mg = v.margin || 0, W = dev().bedW, H = dev().bedH;
+  let overflow = false;
+  edit(() => {
+    const us = units(objs);
+    if (v.rotate) for (const u of us) {
+      const w = u.b.maxX - u.b.minX, h = u.b.maxY - u.b.minY;
+      if (h > w * 1.05 && h <= W - 2 * mg) { applyRotate(origOf(u.list), 90, (u.b.minX + u.b.maxX) / 2, (u.b.minY + u.b.maxY) / 2); u.b = boundsOf(u.list); }
+    }
+    us.sort((a, b) => (b.b.maxY - b.b.minY) - (a.b.maxY - a.b.minY));
+    let x = mg, y = mg, rowH = 0;
+    for (const u of us) {
+      const w = u.b.maxX - u.b.minX, h = u.b.maxY - u.b.minY;
+      if (x > mg && x + w > W - mg) { x = mg; y += rowH + gap; rowH = 0; }
+      if (y + h > H - mg) overflow = true;
+      moveUnit(u, x - u.b.minX, y - u.b.minY);
+      x += w + gap; rowH = Math.max(rowH, h);
+    }
+  });
+  msg(overflow ? 'Packed, but some parts did not fit on the bed' : 'Packed onto the bed', overflow ? 'err' : 'ok');
+}
+
+// Print and cut: line up the design with something already printed, using two registration marks.
+function printAndCutDialog() {
+  const marks = selected();
+  if (marks.length !== 2) return msg('Select exactly two registration marks in the design first (any two shapes — their centres are used)');
+  const ctr = o => { const b = objBounds(o); return [(b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2]; };
+  const A = marks.map(ctr), got = [null, null];
+  let allowScale = false;
+  return panelDialog('Print and cut', redraw => {
+    const rec = i => el('button', {
+      type: 'button', disabled: !S.m.wpos,
+      onclick: () => { got[i] = machineToDesign(dev(), S.m.wpos[0], S.m.wpos[1]); redraw(); },
+    }, got[i] ? `Mark ${i + 1} recorded ✓ (record again)` : `Laser is on mark ${i + 1} — record`);
+    const go = i => el('button', { type: 'button', disabled: !S.m.connected, onclick: guard(() => { const [mx, my] = mapToMachine(dev(), A[i][0], A[i][1]); return isRuida() ? machine.ruida('goto', { x: mx, y: my }) : machine.send(C().goTo(mx, my)); }) }, `Move near mark ${i + 1}`);
+    const kids = [
+      el('p', { class: 'muted small' }, '1. Put the printed sheet on the bed. 2. Jog the laser (use the red dot / a low test fire) exactly onto each printed mark and record it. 3. Align. The whole design is moved and rotated to match the sheet, and Start from is set to Absolute coords.'),
+      el('div', { class: 'row gap wrap' }, go(0), rec(0)),
+      el('div', { class: 'row gap wrap' }, go(1), rec(1)),
+      check('Also scale the design to match (if the print shrank or stretched)', chkInput(allowScale, x => { allowScale = x; })),
+    ];
+    if (!S.m.connected) kids.push(el('p', { class: 'muted small' }, 'Connect to the laser to record positions (close this, connect in the Laser tab, then reopen).'));
+    if (got[0] && got[1]) {
+      const da = Math.hypot(A[1][0] - A[0][0], A[1][1] - A[0][1]), db = Math.hypot(got[1][0] - got[0][0], got[1][1] - got[0][1]);
+      const ang = (Math.atan2(got[1][1] - got[0][1], got[1][0] - got[0][0]) - Math.atan2(A[1][1] - A[0][1], A[1][0] - A[0][0])) / G.D2R;
+      kids.push(el('p', {}, `Measured: rotation ${ang.toFixed(2)}°, distance ${r3(db)} mm vs ${r3(da)} mm in the design (${((db / da - 1) * 100).toFixed(2)}%).`),
+        el('button', {
+          type: 'button', class: 'primary', onclick: () => {
+            const k = allowScale && da > 0 ? db / da : 1;
+            const ma = [(A[0][0] + A[1][0]) / 2, (A[0][1] + A[1][1]) / 2], mb = [(got[0][0] + got[1][0]) / 2, (got[0][1] + got[1][1]) / 2];
+            edit(() => {
+              if (k !== 1) applyScale(origOf(S.objects), k, k, ma[0], ma[1]);
+              applyRotate(origOf(S.objects), ang, ma[0], ma[1]);
+              S.objects.forEach(o => { o.tf = { ...o.tf, x: o.tf.x + mb[0] - ma[0], y: o.tf.y + mb[1] - ma[1] }; });
+            });
+            settings.startFrom = 'absolute'; $('#j-start').value = 'absolute'; saveSettings(); syncAnchor();
+            msg('Design aligned to the printed marks. Frame to check before cutting.', 'ok');
+            $('#dlg').close();
+          },
+        }, 'Align design to the marks'));
+    }
+    return kids;
+  });
+}
+
+// CSV merge for variable text.
+function parseCsv(text) {
+  const rows = []; let row = [], f = '', q = false;
+  const sep = (text.split('\n')[0].match(/;/g) || []).length > (text.split('\n')[0].match(/,/g) || []).length ? ';' : ',';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) { if (ch === '"') { if (text[i + 1] === '"') { f += '"'; i++; } else q = false; } else f += ch; }
+    else if (ch === '"') q = true;
+    else if (ch === sep) { row.push(f); f = ''; }
+    else if (ch === '\n' || ch === '\r') { if (ch === '\r' && text[i + 1] === '\n') i++; row.push(f); f = ''; if (row.some(x => x !== '')) rows.push(row); row = []; }
+    else f += ch;
+  }
+  row.push(f); if (row.some(x => x !== '')) rows.push(row);
+  return rows;
+}
+function csvDialog() {
+  return panelDialog('Variable text data (CSV merge)', redraw => {
+    const c = textVars.csv;
+    const file = el('input', { type: 'file', accept: '.csv,text/csv,text/plain' });
+    file.addEventListener('change', async () => {
+      const f = file.files[0]; if (!f) return;
+      const rows = parseCsv(await f.text());
+      if (rows.length < 2) return msg('The CSV needs a header row and at least one data row', 'err');
+      textVars.csv = { name: f.name, headers: rows[0], rows: rows.slice(1) }; textVars.csvRow = 0;
+      settings.csv = textVars.csv; settings.csvRow = 0; saveSettings(); changed(); redraw();
+    });
+    const kids = [el('p', { class: 'muted small' }, 'Load a spreadsheet saved as CSV (first row = column names). In any text object, {csv:Name} is replaced by that column from the current row, or {col:2} by the 2nd column. After each job the row can advance automatically — great for name tags and serial plates.'), field('CSV file', file)];
+    if (c) {
+      const setRow = n => { textVars.csvRow = settings.csvRow = clamp(n, 0, c.rows.length - 1); saveSettings(); changed(); redraw(); };
+      kids.push(el('p', {}, `${c.name}: ${c.rows.length} rows · columns: ${c.headers.map(h => `{csv:${h}}`).join(' ')}`),
+        el('div', { class: 'row gap' }, el('button', { type: 'button', onclick: () => setRow(textVars.csvRow - 1) }, '◀'), el('b', {}, `Row ${textVars.csvRow + 1} of ${c.rows.length}`), el('button', { type: 'button', onclick: () => setRow(textVars.csvRow + 1) }, '▶')),
+        el('p', { class: 'muted small' }, c.headers.map((h, i) => `${h}: ${c.rows[textVars.csvRow][i] ?? ''}`).join(' · ')),
+        check('Advance to the next row after each job', chkInput(settings.csvAuto !== false, x => { settings.csvAuto = x; saveSettings(); })),
+        el('button', { type: 'button', onclick: () => { textVars.csv = settings.csv = null; saveSettings(); changed(); redraw(); } }, 'Remove CSV data'));
+    }
+    return kids;
+  });
+}
+
 const ACTIONS = {
   async new() {
     if (S.objects.length && !(await confirmDialog('Start a new project?', 'Unsaved changes in the current design will be lost.', 'New project'))) return;
@@ -1349,6 +1553,11 @@ const ACTIONS = {
   'machine-settings': () => machineSettingsDialog(),
   'goto-sel': () => gotoSelection(),
   'user-origin': () => userOriginDialog(),
+  qr: () => qrDialog(),
+  'material-test': () => materialTestDialog(),
+  pack: () => packDialog(),
+  'print-cut': () => printAndCutDialog(),
+  csv: () => csvDialog(),
 };
 function act(name) { closeMenus(); const f = ACTIONS[name]; if (f) f(); }
 $$('[data-act]').forEach(b => b.addEventListener('click', () => act(b.dataset.act)));
@@ -1715,6 +1924,9 @@ function renderLayers() {
     if (L.tabs) kids.push(field('Tabs per shape', numInput(L.tabCount, setL('tabCount'), { min: 0, step: 1 })),
       field('…or one every (mm)', numInput(L.tabSpacing, setL('tabSpacing'), { min: 0 })),
       field('Tab width (mm)', numInput(L.tabWidth, setL('tabWidth'), { min: 0.05, step: 0.1 })));
+    kids.push(field('Overcut (mm)', numInput(L.overcut || 0, setL('overcut'), { min: 0 })),
+      field('Lead-in (mm)', numInput(L.leadIn || 0, setL('leadIn'), { min: 0 })),
+      el('div', { class: 'muted small', style: 'margin:-2px 0 2px 120px' }, 'Overcut runs past the start so closed shapes fully separate. Lead-in starts the cut in the scrap so the pierce mark is not on the part. (Not used with tabs.)'));
     kids.push(check('Perforation (dashed cut)', chkInput(L.perf, setL('perf'))));
     if (L.perf) kids.push(field('Cut length (mm)', numInput(L.perfCut, setL('perfCut'), { min: 0.05 })), field('Skip length (mm)', numInput(L.perfSkip, setL('perfSkip'), { min: 0.05 })));
   }
@@ -2126,6 +2338,10 @@ $('#j-start-btn').addEventListener('click', guard(async () => {
   log(`Job started: ${job.stats.lines} lines`, 'sys');
   if (settings.serialAuto && S.objects.some(o => o.type === 'text' && /\{serial/.test(o.text))) {
     settings.serial += 1; textVars.serial = settings.serial; saveSettings(); changed();
+  }
+  if (textVars.csv && settings.csvAuto !== false && S.objects.some(o => o.type === 'text' && /\{(csv|col):/.test(o.text))) {
+    if (textVars.csvRow < textVars.csv.rows.length - 1) { textVars.csvRow = settings.csvRow = textVars.csvRow + 1; saveSettings(); changed(); msg(`CSV: now on row ${textVars.csvRow + 1} of ${textVars.csv.rows.length}`); }
+    else msg('CSV: that was the last row', 'err');
   }
 }));
 $('#j-pause').addEventListener('click', guard(() => isRuida() ? machine.ruida('pause') : machine.post('job/pause')));

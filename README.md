@@ -66,7 +66,11 @@ constant-power override, Z offset/step per pass. Line: kerf compensation, tabs, 
 Fill: interval, overscan, bi-directional, angle, cross-hatch, one-shape-at-a-time. Image: Floyd–Steinberg, Jarvis,
 Stucki, Atkinson, ordered, halftone, threshold, grayscale (G-code devices); brightness, contrast, gamma, invert.
 
-**Material library** — save/apply/import/export layer presets.
+**Material library** — save/apply/import/export layer presets. **Material test** generator (power × speed grid with labels).
+
+**Production** — QR codes (any text/link, 4 error-correction levels), CSV merge for variable text (`{csv:Name}`, `{col:2}`,
+auto-advance per job), pack parts onto the bed, **print and cut** (align the design to two printed registration marks,
+with optional scale correction), overcut and lead-in for clean closed cuts.
 
 **Machine** — connect, live position, jog in screen directions, home, unlock, set/go to origin, go to selection,
 test fire, macros, GRBL `$$` editor, frame (box or rubber-band), **dry run**, **power limit**, refuses cuts outside
@@ -75,7 +79,7 @@ Ruida).
 
 ## Not supported
 
-Trocen, TopWisdom and EZCad/BJJCZ galvo controllers; camera alignment; print-and-cut; nesting.
+Trocen, TopWisdom and EZCad/BJJCZ galvo controllers; camera alignment; true-shape nesting (packing uses bounding boxes).
 
 ## Safety
 

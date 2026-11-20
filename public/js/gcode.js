@@ -125,7 +125,7 @@ function orderPolys(polys, sx, sy) {
       let pts = it.p.pts;
       if (it.p.closed) pts = pts.slice(bestIdx).concat(pts.slice(0, bestIdx));
       else if (bestRev) pts = pts.slice().reverse();
-      out.push({ closed: it.p.closed, pts });
+      out.push({ closed: it.p.closed, pts, depth: it.depth });
       const last = it.p.closed ? pts[0] : pts[pts.length - 1];
       x = last[0]; y = last[1];
     }
@@ -145,6 +145,34 @@ function burnPath(em, pts, L, F) {
   }
 }
 
+// Closed loop (first point repeated at the end) -> adds a lead-in from the scrap side and an overcut past the start.
+// depth: nesting level from orderPolys (even = part outline, scrap outside; odd = hole, scrap inside).
+export function leadAndOvercut(loop, depth, leadIn, overcut, ring = loop) {
+  let pts = loop;
+  if (overcut > 0) {
+    const extra = [];
+    let left = overcut;
+    for (let i = 1; i < ring.length && left > 1e-9; i++) {
+      const a = ring[i - 1], b = ring[i], d = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (d >= left) { extra.push([a[0] + (b[0] - a[0]) * left / d, a[1] + (b[1] - a[1]) * left / d]); left = 0; }
+      else { extra.push(b); left -= d; }
+    }
+    pts = pts.concat(extra);
+  }
+  if (leadIn > 0 && ring.length > 2) {
+    const [x0, y0] = ring[0];
+    let k = 1;
+    while (k < ring.length - 1 && Math.hypot(ring[k][0] - x0, ring[k][1] - y0) < 1e-6) k++;
+    const dx = ring[k][0] - x0, dy = ring[k][1] - y0, l = Math.hypot(dx, dy) || 1;
+    const n = [-dy / l, dx / l], eps = Math.min(0.01, leadIn / 10);
+    const inside = G.pointInPoly(x0 + n[0] * eps, y0 + n[1] * eps, ring);
+    const wantInside = depth % 2 === 1; // holes: approach from inside the hole
+    const s = inside === wantInside ? 1 : -1;
+    pts = [[x0 + n[0] * leadIn * s, y0 + n[1] * leadIn * s], ...pts];
+  }
+  return pts;
+}
+
 function emitLines(em, objs, L) {
   let polys = objs.flatMap(o => worldPolys(o)).filter(p => p.pts.length >= 2);
   if (L.kerf) { // grow parts / shrink holes by half the beam width
@@ -155,7 +183,8 @@ function emitLines(em, objs, L) {
   const F = Math.round(L.speed * 60);
   const tabs = L.tabs ? { count: L.tabCount, spacing: L.tabSpacing, width: L.tabWidth } : null;
   for (const p of orderPolys(polys, em.x ?? 0, em.y ?? 0)) {
-    const pieces = tabs ? splitTabs(p.pts, p.closed, tabs) : [p.closed ? [...p.pts, p.pts[0]] : p.pts];
+    let pieces = tabs ? splitTabs(p.pts, p.closed, tabs) : [p.closed ? [...p.pts, p.pts[0]] : p.pts];
+    if (!tabs && p.closed && (L.overcut > 0 || L.leadIn > 0)) pieces = [leadAndOvercut(pieces[0], p.depth || 0, L.leadIn || 0, L.overcut || 0)];
     for (const pts of pieces) if (pts.length >= 2) burnPath(em, pts, L, F);
   }
 }
