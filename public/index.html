@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BeamForge</title>
+<link rel="icon" href="icon.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><img src="icon.svg" alt="" class="logo"> BeamForge</div>
+  <nav class="menubar">
+    <div class="menu"><button class="menu-btn">File</button>
+      <div class="menu-pop">
+        <button data-act="new">New project</button>
+        <button data-act="open">Open project…<kbd>Ctrl+O</kbd></button>
+        <button data-act="save">Save project<kbd>Ctrl+S</kbd></button>
+        <hr>
+        <button data-act="import">Import SVG / DXF / PLT / image…<kbd>Ctrl+I</kbd></button>
+        <button data-act="export-svg">Export SVG…</button>
+        <button data-act="export-dxf">Export DXF…</button>
+        <hr>
+        <button data-act="export">Save G-code / Ruida RD file…<kbd>Ctrl+E</kbd></button>
+        <button data-act="run-file">Run a G-code file on the laser…</button>
+      </div>
+    </div>
+    <div class="menu"><button class="menu-btn">Edit</button>
+      <div class="menu-pop">
+        <button data-act="undo">Undo<kbd>Ctrl+Z</kbd></button>
+        <button data-act="redo">Redo<kbd>Ctrl+Y</kbd></button>
+        <hr>
+        <button data-act="cut">Cut<kbd>Ctrl+X</kbd></button>
+        <button data-act="copy">Copy<kbd>Ctrl+C</kbd></button>
+        <button data-act="paste">Paste<kbd>Ctrl+V</kbd></button>
+        <button data-act="dup">Duplicate<kbd>Ctrl+D</kbd></button>
+        <button data-act="del">Delete<kbd>Del</kbd></button>
+        <button data-act="select-all">Select all<kbd>Ctrl+A</kbd></button>
+        <hr>
+        <button data-act="topath">Convert to path</button>
+        <button data-act="break">Break apart</button>
+        <button data-act="join">Auto-join open paths…</button>
+        <button data-act="close-paths">Close open paths</button>
+        <hr>
+        <button data-act="settings">Preferences…</button>
+      </div>
+    </div>
+    <div class="menu"><button class="menu-btn">Arrange</button>
+      <div class="menu-pop">
+        <button data-act="group">Group<kbd>Ctrl+G</kbd></button>
+        <button data-act="ungroup">Ungroup<kbd>Ctrl+Shift+G</kbd></button>
+        <hr>
+        <button data-act="al-l">Align left</button>
+        <button data-act="al-hc">Align centres horizontally</button>
+        <button data-act="al-r">Align right</button>
+        <button data-act="al-t">Align top</button>
+        <button data-act="al-vc">Align centres vertically</button>
+        <button data-act="al-b">Align bottom</button>
+        <button data-act="dist-h">Distribute horizontally</button>
+        <button data-act="dist-v">Distribute vertically</button>
+        <button data-act="center">Centre on bed</button>
+        <hr>
+        <button data-act="mirror-h">Mirror horizontally</button>
+        <button data-act="mirror-v">Mirror vertically</button>
+        <button data-act="rot-cw">Rotate 90° clockwise</button>
+        <button data-act="rot-ccw">Rotate 90° counter-clockwise</button>
+        <hr>
+        <button data-act="array">Grid array…</button>
+        <button data-act="circ-array">Circular array…</button>
+      </div>
+    </div>
+    <div class="menu"><button class="menu-btn">Tools</button>
+      <div class="menu-pop">
+        <button data-act="weld">Weld (union)</button>
+        <button data-act="subtract">Boolean subtract</button>
+        <button data-act="intersect">Boolean intersect</button>
+        <button data-act="xor">Boolean exclude (XOR)</button>
+        <button data-act="offset">Offset shapes…</button>
+        <hr>
+        <button data-act="trace">Trace image…</button>
+        <button data-act="tool-node">Edit nodes<kbd>N</kbd></button>
+        <button data-act="tool-measure">Measure<kbd>M</kbd></button>
+      </div>
+    </div>
+    <div class="menu"><button class="menu-btn">Laser</button>
+      <div class="menu-pop">
+        <button data-act="devices">Devices…</button>
+        <button data-act="machine-settings">Machine settings…</button>
+        <button data-act="rotary">Rotary setup…</button>
+        <button data-act="macros">Edit macros…</button>
+        <hr>
+        <button data-act="library">Material library…</button>
+        <button data-act="goto-sel">Move laser to selection</button>
+      </div>
+    </div>
+  </nav>
+  <div class="group">
+    <button data-act="import" title="Import (Ctrl+I)">Import</button>
+    <button data-act="undo" title="Undo (Ctrl+Z)">↶</button>
+    <button data-act="redo" title="Redo (Ctrl+Y)">↷</button>
+  </div>
+  <div class="spacer"></div>
+  <div class="group">
+    <select id="dev-select" title="Active laser device"></select>
+    <button data-act="fit" title="Zoom to bed (F)">Fit</button>
+    <button data-act="preview" id="btn-preview" title="Toolpath preview (Alt+P)">Preview</button>
+  </div>
+</header>
+
+<div class="main">
+  <nav class="tools" aria-label="Drawing tools">
+    <button data-tool="select" title="Select / move (V)" class="active"><svg viewBox="0 0 24 24"><path d="M5 3l14 8-6 1.5L10 19z"/></svg></button>
+    <button data-tool="node" title="Edit nodes (N) — drag points · double-click a line to add · Del removes"><svg viewBox="0 0 24 24"><path d="M5 18L12 6l7 12"/><rect x="3" y="16" width="4" height="4"/><rect x="10" y="4" width="4" height="4"/><rect x="17" y="16" width="4" height="4"/></svg></button>
+    <button data-tool="rect" title="Rectangle (R)"><svg viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12" rx="1"/></svg></button>
+    <button data-tool="ellipse" title="Ellipse (E)"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="8" ry="6"/></svg></button>
+    <button data-tool="polygon" title="Polygon / star (P)"><svg viewBox="0 0 24 24"><path d="M12 3l8 6-3 10H7L4 9z"/></svg></button>
+    <button data-tool="line" title="Line / polyline (L)"><svg viewBox="0 0 24 24"><path d="M4 19L10 7l5 8 5-10"/></svg></button>
+    <button data-tool="text" title="Text (T)"><svg viewBox="0 0 24 24"><path d="M5 5h14M12 5v14M9 19h6"/></svg></button>
+    <button data-tool="measure" title="Measure (M)"><svg viewBox="0 0 24 24"><path d="M3 17L17 3l4 4L7 21z"/><path d="M7 13l2 2M10 10l2 2M13 7l2 2"/></svg></button>
+    <hr>
+    <button data-act="weld" title="Weld selected shapes"><svg viewBox="0 0 24 24"><path d="M3 9h8V5h10v10h-8v4H3z"/></svg></button>
+    <button data-act="subtract" title="Subtract: first shape minus the others"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="13" height="13"/><rect x="9" y="9" width="12" height="12" stroke-dasharray="2 2"/></svg></button>
+    <button data-act="offset" title="Offset shapes"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="8" height="8"/><rect x="3" y="3" width="18" height="18" rx="4"/></svg></button>
+    <button data-act="import" title="Import image or vector file"><svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="1"/><path d="M4 16l5-5 4 4 2-2 5 5"/><circle cx="15" cy="9" r="1.5"/></svg></button>
+  </nav>
+
+  <div class="stage" id="stage">
+    <canvas id="cv"></canvas>
+    <div id="hint" class="hint"></div>
+    <div id="preview-bar" class="preview-bar" hidden>
+      <span id="pv-stats"></span>
+      <input type="range" id="pv-scrub" min="0" max="1000" value="1000" aria-label="Preview progress">
+    </div>
+  </div>
+
+  <aside class="panel">
+    <div class="tabs" role="tablist">
+      <button data-tab="cuts" class="active">Cuts</button>
+      <button data-tab="shape">Shape</button>
+      <button data-tab="laser">Laser</button>
+      <button data-tab="console">Console</button>
+    </div>
+
+    <section id="tab-cuts" class="tab active">
+      <div id="layer-list" class="layer-list"></div>
+      <div class="row gap"><button id="btn-add-layer">+ Layer</button><span class="muted small">Click a colour below to move the selection to that layer.</span></div>
+      <div id="layer-edit" class="form"></div>
+    </section>
+
+    <section id="tab-shape" class="tab">
+      <div id="shape-edit" class="form"></div>
+    </section>
+
+    <section id="tab-laser" class="tab">
+      <div class="row gap"><span class="muted">Device</span><b id="m-devname"></b></div>
+      <div class="form">
+        <label class="fld"><span>Port</span><div class="row"><select id="m-port"></select><button id="m-refresh" title="Refresh ports">↻</button></div></label>
+        <label class="fld"><span>Baud</span><select id="m-baud"><option>115200</option><option>250000</option><option>230400</option><option>57600</option><option>38400</option><option>9600</option></select></label>
+        <div class="row gap"><button id="m-connect" class="primary">Connect</button><span id="m-conn" class="pill">Offline</span></div>
+      </div>
+      <div class="dro">
+        <div><span class="muted">State</span><b id="m-state">—</b></div>
+        <div><span class="muted">X</span><b id="m-x">—</b></div>
+        <div><span class="muted">Y</span><b id="m-y">—</b></div>
+      </div>
+      <h3>Move</h3>
+      <div class="jog">
+        <div class="pad">
+          <button data-jog="-1,1" title="Move left and back">↖</button><button data-jog="0,1" title="Move toward the back">↑</button><button data-jog="1,1" title="Move right and back">↗</button>
+          <button data-jog="-1,0" title="Move left">←</button><button id="m-home" title="Home">⌂</button><button data-jog="1,0" title="Move right">→</button>
+          <button data-jog="-1,-1" title="Move left and forward">↙</button><button data-jog="0,-1" title="Move toward the front">↓</button><button data-jog="1,-1" title="Move right and forward">↘</button>
+        </div>
+        <div class="form compact">
+          <label class="fld"><span>Step mm</span><select id="m-step"><option>0.1</option><option>1</option><option selected>10</option><option>50</option><option>100</option></select></label>
+          <label class="fld"><span>Speed mm/min</span><input id="m-jogf" type="number" min="10" step="100" value="3000"></label>
+        </div>
+      </div>
+      <div class="row wrap gap">
+        <button id="m-unlock" title="Clear alarm / resume after halt">Unlock</button>
+        <button id="m-setorigin" title="Make the current position X0 Y0">Set origin</button>
+        <button id="m-goorigin" title="Move to X0 Y0">Go to origin</button>
+        <button id="m-gosel" title="Move the head to the centre of the selection">Go to selection</button>
+        <button id="m-pulse" title="Short low-power pulse to find the beam">Test fire</button>
+      </div>
+      <div id="m-macros" class="row wrap gap"></div>
+      <h3>Job</h3>
+      <div class="form">
+        <label class="fld"><span>Start from</span><select id="j-start"><option value="absolute">Absolute coords</option><option value="current">Current position</option></select></label>
+        <label class="fld" id="j-anchor-wrap"><span>Job anchor</span><select id="j-anchor"><option value="bl">Bottom-left</option><option value="tl">Top-left</option><option value="tr">Top-right</option><option value="br">Bottom-right</option><option value="c">Centre</option></select></label>
+        <label class="fld chk"><input type="checkbox" id="j-selonly"><span>Cut selected graphics only</span></label>
+        <label class="fld chk"><input type="checkbox" id="j-rubber"><span>Rubber-band frame (convex outline)</span></label>
+        <label class="fld chk" title="Runs the whole job with the laser power at 0% so you can watch the head trace the path safely"><input type="checkbox" id="j-dry"><span><b>Dry run</b> — laser off, motion only</span></label>
+      </div>
+      <div class="row wrap gap">
+        <button id="j-frame" title="Trace the job outline with the laser off">Frame</button>
+        <button id="j-frame-on" title="Trace the outline with the laser at low power">Frame (beam)</button>
+      </div>
+      <div class="row wrap gap">
+        <button id="j-start-btn" class="primary">Start</button>
+        <button id="j-pause">Pause</button>
+        <button id="j-resume">Resume</button>
+        <button id="j-stop" class="danger">Stop</button>
+      </div>
+      <div class="progress"><div id="j-bar"></div></div>
+      <div id="j-info" class="muted small"></div>
+    </section>
+
+    <section id="tab-console" class="tab">
+      <div id="con-log" class="console" aria-live="polite"></div>
+      <form id="con-form" class="row"><input id="con-in" placeholder="G-code or controller command…" autocomplete="off"><button>Send</button></form>
+      <div class="row wrap gap">
+        <button data-cmd="$$">$$ settings</button><button data-cmd="$I">$I info</button><button data-cmd="$G">$G state</button><button data-cmd="$#">$# offsets</button><button data-cmd="M114">M114 pos</button><button id="con-clear">Clear</button>
+      </div>
+    </section>
+  </aside>
+</div>
+
+<div class="palette" id="palette" aria-label="Layer colours"></div>
+<footer class="status">
+  <span id="st-xy">X — Y —</span>
+  <span id="st-sel"></span>
+  <span id="st-server" class="pill">server</span>
+  <span id="st-msg" class="msg"></span>
+</footer>
+
+<input type="file" id="file-import" hidden multiple accept=".svg,.dxf,.plt,.hpgl,.png,.jpg,.jpeg,.bmp,.gif,.webp,image/*">
+<input type="file" id="file-open" hidden accept=".bfp,.json">
+<input type="file" id="file-gcode" hidden accept=".gcode,.gc,.nc,.ngc,.txt">
+<input type="file" id="file-lib" hidden accept=".json">
+<dialog id="dlg"><form method="dialog" id="dlg-form"></form></dialog>
+
+<script src="vendor/clipper.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+{
+  "name": "beamforge",
+  "version": "0.3.0",
+  "description": "Laser engraver design and control app for GRBL, Smoothieware, Marlin and Ruida controllers",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tests/core.test.mjs && node tests/ruida.test.mjs"
+  },
+  "engines": { "node": ">=18" }
+}

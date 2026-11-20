@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Start BeamForge (if it isn't already running) and open it in a browser window.
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+PORT="${BEAMFORGE_PORT:-8787}"
+URL="http://localhost:$PORT"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/beamforge.log"
+mkdir -p "$(dirname "$LOG")"
+
+running() { curl -s -o /dev/null -m 1 "$URL/" ; }
+
+if ! running; then
+  BEAMFORGE_AUTO_EXIT=1 nohup node server.js >"$LOG" 2>&1 &
+  for _ in $(seq 1 40); do running && break; sleep 0.1; done
+  if ! running; then
+    notify-send -i beamforge "BeamForge" "Could not start the server. See $LOG" 2>/dev/null
+    echo "BeamForge failed to start, see $LOG" >&2
+    exit 1
+  fi
+fi
+
+if command -v firefox >/dev/null; then
+  firefox --new-window "$URL" >/dev/null 2>&1 &
+else
+  xdg-open "$URL" >/dev/null 2>&1 &
+fi
