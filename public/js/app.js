@@ -1703,6 +1703,9 @@ function distribute(axis) {
 }
 
 // ================================================================ import
+// Note: the file inputs deliberately have no `accept` filter. On KDE/GTK desktops Firefox's filtered file dialog can
+// hide valid files (it may default to the first type only, and patterns are case-sensitive, hiding IMG_1.JPG).
+// importFile() checks the type itself and explains what is supported.
 $('#file-import').addEventListener('change', async e => {
   const files = [...e.target.files]; e.target.value = '';
   for (const f of files) await importFile(f);
@@ -1728,7 +1731,8 @@ async function importFile(f) {
     else if (ext === 'dxf') importDxf(await readFile(f), f.name);
     else if (ext === 'plt' || ext === 'hpgl') importPlt(await readFile(f), f.name);
     else if (f.type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp'].includes(ext)) await importImage(await readFile(f, 'url'), f.name);
-    else throw new Error(`Unsupported file type: .${ext}`);
+    else if (ext === 'bfp') await loadProject(JSON.parse(await readFile(f)));
+    else throw new Error(`Can't import .${ext} files. Supported: SVG, DXF, PLT/HPGL, PNG, JPG, BMP, GIF, WebP (and .bfp projects).`);
   } catch (err) { msg(`${f.name}: ${err.message}`, 'err'); }
 }
 
