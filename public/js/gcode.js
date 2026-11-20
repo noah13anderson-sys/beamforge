@@ -5,6 +5,8 @@ import { makeCanvas, imageSource, imageFilter, dither } from './raster.js';
 import { offset, concentric, splitTabs, dashes, hull } from './ops.js';
 import { profile, family, mapToMachine, rotaryScale } from './devices.js';
 import { encodeJob } from './ruida.js';
+import { generateCnc, cncFrameGcode } from './cnc.js';
+import { isCnc } from './devices.js';
 
 export const fmt = v => {
   if (Math.abs(v) < 0.0005) return '0';
@@ -87,7 +89,7 @@ class RuidaEmitter extends Emitter {
 
 // ---------------------------------------------------------------- vector cuts
 // Inner shapes first (so parts don't drop before their holes are cut), then nearest-neighbour order.
-function orderPolys(polys, sx, sy) {
+export function orderPolys(polys, sx, sy) {
   const items = polys.map(p => ({ p, b: G.boundsOfPolys([p]), depth: 0 }));
   if (items.length < 4000) {
     for (const a of items) {
@@ -356,6 +358,10 @@ export function generateJob(doc, cfg, opts = {}) {
     stats: { time: em.time, cutLen: em.cutLen, travelLen: em.travelLen, lines: em.out ? em.out.length : em.count },
   });
 
+  if (isCnc(cfg)) {
+    const home = opts.startFrom === 'absolute' || !opts.startFrom ? [0, 0] : startPoint(cfg, opts);
+    return { ...generateCnc(groups, cfg, { ...opts, home }, off), designBounds: b, offset: off };
+  }
   if (family(cfg) === 'ruida') {
     const em = new RuidaEmitter(cfg, off);
     for (const g of groups) {
@@ -416,6 +422,7 @@ export function jobFrame(doc, cfg, opts, rubberBand = false) {
 }
 
 export function frameGcode(cfg, pts, beamPct, feed) {
+  if (isCnc(cfg)) return cncFrameGcode(cfg, pts, feed);
   const prof = profile(cfg);
   const S = beamPct > 0 ? (cfg.sMax <= 1 ? fmt(beamPct / 100 * cfg.sMax) : Math.round(beamPct / 100 * cfg.sMax)) : 0;
   const lines = ['G21', 'G90', `G0 X${fmt(pts[0][0])} Y${fmt(pts[0][1])}`];

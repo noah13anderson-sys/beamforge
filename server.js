@@ -105,10 +105,11 @@ class VirtualGrbl {
     if (!this.queue.length) { this.state = 'Idle'; return; }
     const line = this.queue.shift();
     this.busy = true; this.state = 'Run';
-    const { ms, reply } = this.exec(line);
+    const { ms, reply, pause } = this.exec(line);
     this.timer = setTimeout(() => {
       this.busy = false;
       this.out(reply);
+      if (pause) this.hold = true; // M0 program pause: wait for cycle start (~)
       if (this.hold) this.state = 'Hold:0';
       this.step();
     }, ms);
@@ -129,6 +130,9 @@ class VirtualGrbl {
     if (line === 'M503') return { ms: 0, reply: 'echo:; Steps per unit:\r\necho:  M92 X80.00 Y80.00 Z400.00\r\nok\r\n' };
     if (/^(M410|M999|M5|FIRE)/.test(line)) { if (!line.startsWith('M999')) this.laserOn = /^FIRE (?!OFF)/.test(line); return { ms: 0, reply: 'ok\r\n' }; }
     if (/^G28/.test(line)) { this.mpos = [0, 0, 0]; return { ms: 600, reply: 'ok\r\n' }; }
+    if (/^M0?0(?!\d)/.test(line) || /^M0?1(?!\d)/.test(line)) return { ms: 0, reply: 'ok\r\n', pause: true };
+    if (/^M0?2(?!\d)|^M30(?!\d)/.test(line)) { this.laserOn = false; return { ms: 0, reply: 'ok\r\n' }; }
+    if (/^G0?4(?!\d)/.test(line)) { const p = +(/P\s*([\d.]+)/.exec(line)?.[1] || 0); return { ms: Math.min(3000, p * 1000 / this.speedup), reply: 'ok\r\n' }; }
     if (/^G92/.test(line)) { this.wco[0] = this.mpos[0]; this.wco[1] = this.mpos[1]; return { ms: 0, reply: 'ok\r\n' }; }
     return this.motion(line, false);
   }
@@ -150,7 +154,13 @@ class VirtualGrbl {
     if (gs.includes(10) && words.L === 20) { // G10 L20 P1: set work origin at current position
       if ('X' in words) this.wco[0] = this.mpos[0] - words.X;
       if ('Y' in words) this.wco[1] = this.mpos[1] - words.Y;
+      if ('Z' in words) this.wco[2] = this.mpos[2] - words.Z;
       return { ms: 0, reply: 'ok\r\n' };
+    }
+    if (gs.includes(38.2)) { // probe: the simulated touch plate is 12 mm below the current height
+      const z = this.mpos[2] - Math.min(12, Math.abs(words.Z ?? 12));
+      this.mpos = [this.mpos[0], this.mpos[1], z];
+      return { ms: 400, reply: `[PRB:${this.mpos.map(v => v.toFixed(3)).join(',')}:1]\r\nok\r\n` };
     }
     if ('F' in words) this.feed = words.F;
     if ('S' in words) this.power = words.S;

@@ -14,7 +14,7 @@ const sq = { id: 's', type: 'rect', w: 20, h: 20, layer: 'a', tf: { x: 50, y: 50
 const job = (dev, layer = L(), objs = [sq], opts = {}) => generateJob({ layers: [layer], objects: objs }, dev, opts);
 
 // --- every controller type
-for (const t of Object.keys(D.DEVICE_TYPES).filter(t => t !== 'ruida')) { // ruida: see ruida.test.mjs
+for (const t of Object.keys(D.DEVICE_TYPES).filter(t => t !== 'ruida' && !D.DEVICE_TYPES[t].kind)) { // ruida: see ruida.test.mjs; CNC: cnc.test.mjs
   const d = D.makeDevice(t);
   const g = job(d).gcode;
   const sVals = [...g.matchAll(/ S([\d.]+)/g)].map(m => +m[1]).filter(v => v > 0);

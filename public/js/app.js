@@ -4,9 +4,10 @@ import { worldPolys, worldPath, objBounds, hitObject, localPolys, textVars, reso
 import { generateJob, jobFrame, frameGcode } from './gcode.js';
 import { loadImage, getImage, imageSource, imageFilter, traceImage } from './raster.js';
 import { offset as offsetPolys, boolean as booleanOp, joinPaths, fillet as filletPolys, reflectTf } from './ops.js';
-import { DEVICE_TYPES, ORIGINS, GRBL_SETTINGS, makeDevice, family, toMachine, mapToMachine, machineToDesign, rotaryScale, commands, screenToMachineDelta } from './devices.js';
+import { DEVICE_TYPES, ORIGINS, GRBL_SETTINGS, isCnc, makeDevice, family, toMachine, mapToMachine, machineToDesign, rotaryScale, commands, screenToMachineDelta } from './devices.js';
 import { swizzle } from './ruida.js';
 import { qrEncode, qrRects } from './qr.js';
+import { CNC_OPS } from './cnc.js';
 import { Machine } from './machine.js';
 
 // ================================================================ utilities
@@ -105,6 +106,9 @@ function layerDefaults(mode = 'line') {
     dither: 'floyd', threshold: 128, halftoneCell: 6, halftoneAngle: 45,
     kerf: 0, overcut: 0, leadIn: 0, tabs: false, tabCount: 4, tabSpacing: 0, tabWidth: 0.5, perf: false, perfCut: 2, perfSkip: 1,
     constant: false, zOffset: 0, zStep: 0, fillGroups: 'all',
+    // CNC router settings (used when the device is a CNC router)
+    cncOp: 'profile', cncSide: 'outside', toolDia: 3.175, depth: 3, stepDown: 1, feed: 1000, plunge: 300, rpm: 12000,
+    stepover: 40, climb: true, cncTabWidth: 6, tabHeight: 1, peck: 0,
   };
 }
 function makeLayer(color, mode = 'line') {
@@ -903,6 +907,9 @@ async function deviceEditDialog(d) {
     { key: 'returnHome', label: 'Return to start when the job finishes', type: 'check', value: d.returnHome },
     { key: 'zEnabled', label: 'Machine has a Z axis (enables Z offset / Z step per pass)', type: 'check', value: d.zEnabled },
     { key: 'powerLimit', label: 'Power limit (%) — caps every layer', type: 'number', value: d.powerLimit ?? 100, min: 0, max: 100 },
+    { key: 'safeZ', label: 'CNC: safe Z height for moves (mm above the material)', type: 'number', value: d.safeZ ?? 5, min: 0.5 },
+    { key: 'spinUp', label: 'CNC: spindle spin-up wait (s)', type: 'number', value: d.spinUp ?? 3, min: 0 },
+    { key: 'probePlate', label: 'CNC: touch plate thickness (mm)', type: 'number', value: d.probePlate ?? 0, min: 0 },
     { key: 'host', label: 'Ruida: controller IP address', value: d.host || '' },
     { key: 'magic', label: 'Ruida: swizzle key', type: 'select', value: String(d.magic ?? 0x88), options: [['136', '0x88 — RDC644x / 654x / 320 (most)'], ['17', '0x11 — RDC634x'], ['56', '0x38 — RDL9635']] },
     { key: 'n', type: 'note', label: 'Max S: GRBL uses $30 (usually 1000). Smoothieware uses 1 (power 0.0–1.0). Marlin uses 255 by default. Changing the controller type resets Max S to its usual value.' },
@@ -912,7 +919,7 @@ async function deviceEditDialog(d) {
   for (const [k, val] of Object.entries(v)) if (!(typeof val === 'number' && Number.isNaN(val))) d[k] = val;
   d.magic = Number(d.magic) || 0x88;
   d.host = String(d.host || '').trim();
-  if (typeChanged) { d.sMax = DEVICE_TYPES[d.type].sMax; d.baud = String(DEVICE_TYPES[d.type].baud); if (DEVICE_TYPES[d.type].origin) d.origin = DEVICE_TYPES[d.type].origin; }
+  if (typeChanged) { d.sMax = DEVICE_TYPES[d.type].sMax; d.baud = String(DEVICE_TYPES[d.type].baud); if (DEVICE_TYPES[d.type].origin) d.origin = DEVICE_TYPES[d.type].origin; if (isCnc(d)) d.air = 'none'; }
   if (d.type === 'ruida' && d.port !== 'virtual') d.port = `udp:${d.host}`;
   saveSettings(); deviceChanged();
   return true;
@@ -1878,6 +1885,47 @@ function refreshPanels() {
 }
 
 const MODE_LABEL = { line: 'Line', fill: 'Fill', offset: 'Offset fill', image: 'Image' };
+// Layer settings for CNC routers.
+function renderCncLayer(L, setL) {
+  const op = L.cncOp || 'profile';
+  const nameIn = el('input', { value: L.name }); nameIn.addEventListener('change', () => edit(() => { L.name = nameIn.value || L.name; }));
+  const colIn = el('input', { type: 'color', value: L.color }); colIn.addEventListener('change', () => edit(() => { L.color = colIn.value; }));
+  const passes = Math.ceil((L.depth ?? 3) / ((L.stepDown ?? 1) || (L.depth ?? 3)) - 1e-6);
+  const kids = [
+    el('h3', {}, 'CNC toolpath'),
+    field('Name', nameIn), field('Colour', colIn),
+    field('Operation', selInput(op, Object.entries(CNC_OPS), setL('cncOp'))),
+  ];
+  if (op === 'profile') kids.push(field('Cut', selInput(L.cncSide || 'outside', [['outside', 'Outside the line (keep the shape)'], ['inside', 'Inside the line (cut a hole)'], ['on', 'On the line']], setL('cncSide'))));
+  kids.push(
+    field('Tool diameter (mm)', numInput(L.toolDia ?? 3.175, setL('toolDia'), { min: 0.1 })),
+    el('div', { class: 'muted small', style: 'margin:-2px 0 2px 120px' }, '1/8" = 3.175 · 1/4" = 6.35'),
+    field('Cut depth (mm)', numInput(L.depth ?? 3, setL('depth'), { min: 0.01 })),
+    field('Depth per pass (mm)', numInput(L.stepDown ?? 1, setL('stepDown'), { min: 0.01 })),
+    el('div', { class: 'muted small', style: 'margin:-2px 0 2px 120px' }, `${passes} pass${passes === 1 ? '' : 'es'} · Z0 is the top of the material`),
+    field('Feed rate (mm/min)', numInput(L.feed ?? 1000, setL('feed'), { min: 1 })),
+    field('Plunge rate (mm/min)', numInput(L.plunge ?? 300, setL('plunge'), { min: 1 })),
+    field('Spindle speed (RPM)', numInput(L.rpm ?? 12000, setL('rpm'), { min: 0 })));
+  if (op === 'pocket') kids.push(field('Stepover (% of tool)', numInput(L.stepover ?? 40, setL('stepover'), { min: 5, max: 95 })));
+  if (op === 'drill') kids.push(field('Peck depth (mm, 0 = none)', numInput(L.peck ?? 0, setL('peck'), { min: 0 })),
+    el('p', { class: 'muted small' }, 'Drills one hole at the centre of each closed shape (draw small circles where you want holes).'));
+  if (op !== 'drill') kids.push(field('Direction', selInput(L.climb !== false ? 'climb' : 'conv', [['climb', 'Climb (smoother finish)'], ['conv', 'Conventional (less chatter on weak machines)']], v => edit(() => { L.climb = v === 'climb'; }))));
+  if (op === 'profile') {
+    kids.push(check('Tabs (hold the part in place)', chkInput(L.tabs, setL('tabs'))));
+    if (L.tabs) kids.push(field('Tabs per shape', numInput(L.tabCount ?? 4, setL('tabCount'), { min: 1, step: 1 })),
+      field('Tab width (mm)', numInput(L.cncTabWidth ?? 6, setL('cncTabWidth'), { min: 0.5 })),
+      field('Tab height (mm)', numInput(L.tabHeight ?? 1, setL('tabHeight'), { min: 0.1 })));
+  }
+  kids.push(field('Repeat whole layer', numInput(L.passes, v => edit(() => { L.passes = Math.max(1, Math.round(v)); }), { min: 1, step: 1 })),
+    check('Coolant / dust extraction (device command)', chkInput(L.air, setL('air'))),
+    el('p', { class: 'muted small' }, 'Always clamp the material, check the bit is tight, and wear eye and ear protection. Run an Air cut (Dry run) first: the spindle stays off and the bit moves above the material.'));
+  const empty = !S.objects.some(o => o.layer === L.id);
+  kids.push(el('div', { class: 'row gap' },
+    el('button', { onclick: () => { S.sel = new Set(S.objects.filter(o => o.layer === L.id).map(o => o.id)); selectionChanged(); } }, 'Select its shapes'),
+    el('button', { disabled: !empty || S.layers.length < 2, onclick: () => edit(() => { S.layers = S.layers.filter(x => x !== L); S.activeLayer = S.layers[0].id; }) }, 'Delete layer')));
+  $('#layer-edit').replaceChildren(...kids);
+}
+
 function renderLayers() {
   const list = $('#layer-list');
   const counts = new Map();
@@ -1890,7 +1938,9 @@ function renderLayers() {
     const row = el('div', { class: `layer-row${L.id === cur.id ? ' active' : ''}${L.output ? '' : ' off'}`, title: 'Click to edit · new shapes go on the active layer' },
       el('span', { class: 'sw', style: `background:${L.color}` }),
       el('span', { class: 'nm' }, `${L.name} `, el('span', { class: 'muted small' }, `· ${counts.get(L.id) || 0}`)),
-      el('span', { class: 'meta' }, `${MODE_LABEL[L.mode]} ${L.speed}mm/s ${L.power}%${L.passes > 1 ? ` ×${L.passes}` : ''}`),
+      el('span', { class: 'meta' }, isCnc(dev())
+        ? `${CNC_OPS[L.cncOp || 'profile'].split(' ')[0]}${(L.cncOp || 'profile') === 'profile' ? ` ${L.cncSide || 'outside'}` : ''} ${L.depth ?? 3}mm Ø${L.toolDia ?? 3.175}`
+        : `${MODE_LABEL[L.mode]} ${L.speed}mm/s ${L.power}%${L.passes > 1 ? ` ×${L.passes}` : ''}`),
       el('span', { class: 'ord' },
         el('button', { title: 'Move up (runs earlier)', disabled: i === 0, onclick: ev => { ev.stopPropagation(); edit(() => { S.layers.splice(i - 1, 0, S.layers.splice(i, 1)[0]); }); } }, '▲'),
         el('button', { title: 'Move down (runs later)', disabled: i === S.layers.length - 1, onclick: ev => { ev.stopPropagation(); edit(() => { S.layers.splice(i + 1, 0, S.layers.splice(i, 1)[0]); }); } }, '▼')),
@@ -1900,6 +1950,7 @@ function renderLayers() {
   }));
 
   const L = cur, setL = k => v => edit(() => { L[k] = v; });
+  if (isCnc(dev())) return renderCncLayer(L, setL);
   const lib = loadLib();
   const libSel = el('select', {}, el('option', { value: '' }, lib.length ? 'Apply a material preset…' : 'No presets saved yet'),
     lib.map((p, i) => el('option', { value: i }, `${p.material}${p.thickness ? ` ${p.thickness}mm` : ''} — ${p.name}`)));
@@ -2167,6 +2218,8 @@ function updateDro() {
   $('#m-state').textContent = S.m.state || '—';
   $('#m-x').textContent = S.m.wpos ? S.m.wpos[0].toFixed(2) : '—';
   $('#m-y').textContent = S.m.wpos ? S.m.wpos[1].toFixed(2) : '—';
+  $('#m-z').textContent = S.m.wpos && S.m.wpos[2] != null ? S.m.wpos[2].toFixed(2) : '—';
+  $('#m-zrow').hidden = !(isCnc(dev()) || dev().zEnabled);
   const st = $('#m-conn');
   if (S.m.connected) {
     const alarm = /Alarm/i.test(S.m.state);
@@ -2179,6 +2232,12 @@ function updateMachineUI() {
   $('#m-connect').classList.toggle('primary', !S.m.connected);
   for (const id of ['m-home', 'm-unlock', 'm-setorigin', 'm-goorigin', 'm-setuser', 'm-gouser', 'm-gosel', 'm-pulse', 'j-frame', 'j-frame-on', 'j-start-btn', 'j-pause', 'j-resume', 'j-stop'])
     $('#' + id).disabled = !S.m.connected;
+  const cnc = isCnc(dev());
+  $('#m-zctl').hidden = !(cnc || dev().zEnabled);
+  for (const id of ['m-zeroz', 'm-probez']) $('#' + id).disabled = !S.m.connected || isRuida();
+  $$('[data-jogz]').forEach(b => { b.disabled = !S.m.connected || isRuida(); });
+  $('#j-dry-label').innerHTML = cnc ? '<b>Air cut</b> — spindle off, bit stays above the material' : '<b>Dry run</b> — laser off, motion only';
+  if (cnc) for (const id of ['m-pulse', 'j-frame-on']) { $('#' + id).disabled = true; $('#' + id).title = 'Not used on CNC routers'; }
   if (isRuida()) { // these are done on the Ruida's own control panel
     for (const id of ['m-unlock', 'm-setorigin', 'm-goorigin', 'm-pulse', 'j-frame-on']) { $('#' + id).disabled = true; $('#' + id).title = 'Use the laser\'s control panel for this on Ruida machines'; }
   }
@@ -2239,6 +2298,14 @@ $('#m-unlock').addEventListener('click', guard(() => machine.send(C().unlock)));
 $('#m-setorigin').addEventListener('click', guard(() => machine.send(C().setOrigin)));
 $('#m-goorigin').addEventListener('click', guard(() => machine.send(C().goOrigin)));
 $('#m-gosel').addEventListener('click', () => gotoSelection());
+$$('[data-jogz]').forEach(b => b.addEventListener('click', guard(() => machine.send(C().jogZ(+b.dataset.jogz * Math.min(10, +$('#m-step').value), Math.min(1000, +$('#m-jogf').value || 600))))));
+$('#m-zeroz').addEventListener('click', guard(async () => {
+  if (await confirmDialog('Set Z zero here?', 'The current height becomes Z0 — this should be the top of the material (touch the bit on it first).', 'Set Z0')) await machine.send(C().zeroZ);
+}));
+$('#m-probez').addEventListener('click', guard(async () => {
+  const t = dev().probePlate ?? 0;
+  if (await confirmDialog('Probe Z?', `Put the touch plate (${t} mm thick, set in the device settings) under the bit and attach the clip. The bit moves down slowly until it touches the plate (up to 30 mm), then Z is set and it lifts 5 mm.`, 'Probe')) await machine.send(C().probeZ(t));
+}));
 function setUserOrigin(pt) {
   dev().userOrigin = pt; saveSettings(); changed(); requestDraw();
   msg(pt ? `User origin set to X ${pt[0].toFixed(2)}, Y ${pt[1].toFixed(2)}` : 'User origin cleared', 'ok');
@@ -2330,8 +2397,12 @@ $('#j-start-btn').addEventListener('click', guard(async () => {
   const job = buildJob();
   const dry = $('#j-dry').checked;
   const ruidaNote = isRuida() && !dry ? ' Ruida support is new and has not been tested on a real machine yet — if you have not done so, cancel and do a Dry run first, then a small test at low power.' : '';
-  const ok = await confirmDialog(dry ? 'Start DRY RUN (laser off)?' : 'Start job?',
-    `${dev().name}: ${job.stats.lines.toLocaleString()} ${isRuida() ? 'moves' : 'lines'} · estimated ${fmtTime(job.stats.time)}.${dry ? ' The laser will not fire; the head just traces the job.' : ' Make sure the material is in place, the lid is closed and you are wearing laser-safe eyewear. Never leave a running laser unattended.'}${ruidaNote}`, dry ? 'Start dry run' : 'Start');
+  const cnc = isCnc(dev());
+  const safety = cnc
+    ? (dry ? ' Air cut: the spindle stays off and every move is lifted above the material.' : ' Check: material clamped, bit tight, Z0 set on the material top, spindle on (if it is not controlled by the machine), eye and ear protection on. Keep a hand near the emergency stop.')
+    : (dry ? ' The laser will not fire; the head just traces the job.' : ' Make sure the material is in place, the lid is closed and you are wearing laser-safe eyewear. Never leave a running laser unattended.');
+  const ok = await confirmDialog(dry ? (cnc ? 'Start AIR CUT (spindle off)?' : 'Start DRY RUN (laser off)?') : 'Start job?',
+    `${dev().name}: ${job.stats.lines.toLocaleString()} ${isRuida() ? 'moves' : 'lines'} · estimated ${fmtTime(job.stats.time)}.${safety}${ruidaNote}`, dry ? (cnc ? 'Start air cut' : 'Start dry run') : 'Start');
   if (!ok) return;
   if (isRuida()) await machine.ruidaJob(job.ruida); else await machine.job(job.gcode);
   if (dry) { log('Dry run started (laser off)', 'sys'); return; }

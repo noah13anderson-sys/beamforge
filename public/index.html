@@ -181,6 +181,7 @@
         <div><span class="muted">State</span><b id="m-state">—</b></div>
         <div><span class="muted">X</span><b id="m-x">—</b></div>
         <div><span class="muted">Y</span><b id="m-y">—</b></div>
+        <div id="m-zrow" hidden><span class="muted">Z</span><b id="m-z">—</b></div>
       </div>
       <h3>Move</h3>
       <div class="jog">
@@ -193,6 +194,12 @@
           <label class="fld"><span>Step mm</span><select id="m-step"><option>0.1</option><option>1</option><option selected>10</option><option>50</option><option>100</option></select></label>
           <label class="fld"><span>Speed mm/min</span><input id="m-jogf" type="number" min="10" step="100" value="3000"></label>
         </div>
+      </div>
+      <div class="row wrap gap" id="m-zctl" hidden>
+        <button data-jogz="1" title="Raise Z by the step">Z ↑</button>
+        <button data-jogz="-1" title="Lower Z by the step">Z ↓</button>
+        <button id="m-zeroz" title="Make the current Z height Z0 (touch the bit on the top of the material first)">Zero Z</button>
+        <button id="m-probez" title="Probe down onto a touch plate and set Z0 (plate thickness is in the device settings)">Probe Z</button>
       </div>
       <div class="row wrap gap">
         <button id="m-unlock" title="Clear alarm / resume after halt">Unlock</button>
@@ -210,7 +217,7 @@
         <label class="fld" id="j-anchor-wrap"><span>Job anchor</span><select id="j-anchor"><option value="bl">Bottom-left</option><option value="tl">Top-left</option><option value="tr">Top-right</option><option value="br">Bottom-right</option><option value="c">Centre</option></select></label>
         <label class="fld chk"><input type="checkbox" id="j-selonly"><span>Cut selected graphics only</span></label>
         <label class="fld chk"><input type="checkbox" id="j-rubber"><span>Rubber-band frame (convex outline)</span></label>
-        <label class="fld chk" title="Runs the whole job with the laser power at 0% so you can watch the head trace the path safely"><input type="checkbox" id="j-dry"><span><b>Dry run</b> — laser off, motion only</span></label>
+        <label class="fld chk" title="Runs the whole job with the laser power at 0% so you can watch the head trace the path safely"><input type="checkbox" id="j-dry"><span id="j-dry-label"><b>Dry run</b> — laser off, motion only</span></label>
       </div>
       <div class="row wrap gap">
         <button id="j-frame" title="Trace the job outline with the laser off">Frame</button>

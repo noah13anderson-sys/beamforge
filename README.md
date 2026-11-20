@@ -1,7 +1,7 @@
 # BeamForge
 
 An original laser-engraver design **and** control app — one program to draw, prepare and run jobs on G-code
-lasers (GRBL, Smoothieware, Marlin) and Ruida DSP CO₂ controllers. Design runs in the browser; a small local
+lasers (GRBL, Smoothieware, Marlin), Ruida DSP CO₂ controllers and **CNC routers** (GRBL / grblHAL / FluidNC). Design runs in the browser; a small local
 Node.js server talks to the laser over USB or the network. No npm packages are needed.
 
 > **Ruida support is new and has only been tested against the built-in virtual controller.**
@@ -24,6 +24,8 @@ Requires Node.js 18+ and a modern browser. Pick **Virtual laser** in the Laser t
 | Marlin 2.x | USB serial | `M3 I` inline laser power (S 0–255), M114 position, M410 quick-stop |
 | **Ruida DSP** (RDC644x / 654x / 634x) — beta | **Network (UDP 50200/40200)** or USB | Job upload with checksums, live position/status, jog, frame, home, pause/resume/stop, RD file export |
 
+| **CNC router** — GRBL, grblHAL, FluidNC | USB serial | Profile / pocket / engrave / drill toolpaths, spindle RPM, Z probing; generic G-code export for Mach3 / LinuxCNC / UCCNC |
+
 Set up any number of machines under **Laser → Devices** (work area, origin corner, power limit, air-assist M-code,
 Z axis, baud, Ruida IP address and swizzle key) and switch between them from the top-right drop-down.
 
@@ -41,6 +43,24 @@ Z axis, baud, Ruida IP address and swizzle key) and switch between them from the
 
 Alternative that skips the network entirely: **File → Save** writes a `.rd` file you can run from a USB stick on
 the laser's panel.
+
+## CNC routers
+
+Add a device of type **CNC router**. On a CNC device the Cuts tab shows router settings instead of laser settings:
+
+- **Operations:** Profile (outside the line to keep the shape, inside to cut a hole, or on the line), Pocket (clears the
+  inside of closed shapes), Engrave (follows the line at depth), Drill (one hole at the centre of each closed shape,
+  with optional pecking).
+- **Settings per layer:** tool diameter, cut depth, depth per pass, feed and plunge rate, spindle RPM, stepover for
+  pockets, climb or conventional milling, tabs (count, width, height), coolant/dust command.
+- Shapes inside other shapes are treated as holes, so an outside profile of a part keeps its holes the right size.
+- Layers with different tool diameters insert a **tool-change pause** (M5 + M0): fit the new bit, re-zero Z, press Resume.
+- **Air cut** (the Dry run box) runs the whole job with the spindle off and every move lifted above the material.
+- Machine panel: Z jog, **Zero Z** (Z0 = top of the material), **Probe Z** with a touch plate (thickness in the device
+  settings), Z readout. Frame lifts to the safe height first.
+- Controller setup: GRBL `$32=0` (laser mode off) and `$30` = your spindle's max RPM.
+
+Always clamp the material, check the bit is tight, wear eye and ear protection, and run an air cut first.
 
 ## Features
 

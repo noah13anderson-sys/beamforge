@@ -14,7 +14,11 @@ export const DEVICE_TYPES = {
   smoothie: { label: 'Smoothieware', family: 'smoothie', power: 'inline', sMax: 1, baud: 115200 },
   marlin: { label: 'Marlin 2.x (laser feature)', family: 'marlin', power: 'M3I', sMax: 255, baud: 250000 },
   ruida: { label: 'Ruida DSP (RDC644x/654x) — beta', family: 'ruida', power: 'ruida', sMax: 100, baud: 115200, origin: 'tr' },
+  // CNC routers: S is spindle RPM (GRBL $30 should be the spindle's max RPM, $32=0).
+  'cnc-grbl': { label: 'CNC router — GRBL / grblHAL / FluidNC', family: 'grbl', power: 'spindle', kind: 'cnc', sMax: 24000, baud: 115200 },
+  'cnc-gcode': { label: 'CNC router — generic G-code (save file for Mach3 / LinuxCNC / UCCNC)', family: 'grbl', power: 'spindle', kind: 'cnc', sMax: 24000, baud: 115200 },
 };
+export const isCnc = cfg => (DEVICE_TYPES[cfg?.type] || {}).kind === 'cnc';
 
 export const ORIGINS = [['bl', 'Front-left'], ['tl', 'Rear-left'], ['tr', 'Rear-right'], ['br', 'Front-right']];
 
@@ -25,10 +29,11 @@ export function makeDevice(type = 'grbl', over = {}) {
   return {
     id: uid(), name: t.label, type,
     bedW: 400, bedH: 400, origin: t.origin || 'bl', sMax: t.sMax, baud: String(t.baud), port: 'virtual',
-    host: '192.168.1.100', magic: 0x88, powerLimit: 100,
+    host: '192.168.1.100', magic: 0x88, powerLimit: 100, safeZ: 5, spinUp: 3, probePlate: 0,
     travel: 100, air: 'M8', returnHome: true, zEnabled: false,
     rotary: false, rotaryType: 'roller', rotaryMmPerRot: 100, rotaryRollerDia: 20, rotaryObjectDia: 80,
     macros: [],
+    ...(t.kind === 'cnc' ? { bedW: 600, bedH: 400, air: 'none', travel: 50 } : {}),
     ...over,
   };
 }
@@ -73,6 +78,10 @@ export function commands(cfg) {
   return {
     S,
     jog: (dx, dy, f) => fam === 'grbl' ? `$J=G91 G21 X${dx} Y${dy} F${f}` : `G91\nG0 X${dx} Y${dy} F${f}\nG90`,
+    jogZ: (dz, f) => fam === 'grbl' ? `$J=G91 G21 Z${dz} F${f}` : `G91\nG0 Z${dz} F${f}\nG90`,
+    zeroZ: fam === 'grbl' ? 'G10 L20 P1 Z0' : 'G92 Z0',
+    // Touch plate: probe down, set Z to the plate thickness, back off 5 mm.
+    probeZ: plate => `G91\nG38.2 Z-30 F100\nG90\n${fam === 'grbl' ? `G10 L20 P1 Z${plate}` : `G92 Z${plate}`}\nG91\nG0 Z5\nG90`,
     home: fam === 'marlin' ? 'G28 X Y' : '$H',
     unlock: fam === 'grbl' ? '$X' : 'M999',
     setOrigin: fam === 'grbl' ? 'G10 L20 P1 X0 Y0' : 'G92 X0 Y0',
