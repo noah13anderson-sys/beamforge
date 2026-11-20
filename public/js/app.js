@@ -3,7 +3,7 @@ import * as G from './geom.js';
 import { worldPolys, worldPath, objBounds, hitObject, localPolys, textVars, resolveText } from './shapes.js';
 import { generateJob, jobFrame, frameGcode } from './gcode.js';
 import { loadImage, getImage, imageSource, imageFilter, traceImage } from './raster.js';
-import { offset as offsetPolys, boolean as booleanOp, joinPaths } from './ops.js';
+import { offset as offsetPolys, boolean as booleanOp, joinPaths, fillet as filletPolys, reflectTf } from './ops.js';
 import { DEVICE_TYPES, ORIGINS, GRBL_SETTINGS, makeDevice, family, toMachine, mapToMachine, machineToDesign, rotaryScale, commands, screenToMachineDelta } from './devices.js';
 import { swizzle } from './ruida.js';
 import { Machine } from './machine.js';
@@ -58,7 +58,7 @@ const PALETTE = ['#1d1d1f', '#1f6feb', '#e5484d', '#2da44e', '#e08a00', '#8957e5
 
 const APP_DEFAULTS = {
   startFrom: 'absolute', anchor: 'bl', jogStep: '10', jogF: 3000, pulsePower: 1, pulseMs: 200, framePower: 1,
-  snap: 0, lockAspect: true, serial: 1, serialAuto: true, devices: [], deviceId: null,
+  snap: 0, lockAspect: true, alignTo: 'auto', serial: 1, serialAuto: true, devices: [], deviceId: null,
 };
 function loadSettings() {
   let s = {};
@@ -1190,6 +1190,22 @@ const ACTIONS = {
   ungroup() { if (!selected().some(o => o.group)) return; edit(() => selected().forEach(o => { delete o.group; })); msg('Ungrouped', 'ok'); },
   'mirror-h'() { mirror(true); },
   'mirror-v'() { mirror(false); },
+  'mirror-both'() {
+    const b = boundsOf(selected()); if (!b) return;
+    const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
+    edit(() => selected().forEach(o => { o.tf = reflectTf(reflectTf(o.tf, 0, cx, cy), 90, cx, cy); }));
+  },
+  'mirror-copy-h'() { const b = boundsOf(selected()); if (b) mirrorSel(90, { copy: true, at: [b.maxX, b.minY] }); },
+  'mirror-copy-v'() { const b = boundsOf(selected()); if (b) mirrorSel(0, { copy: true, at: [b.minX, b.maxY] }); },
+  'mirror-line'() { mirrorLineDialog(); },
+  fillet() { filletDialog({ style: 'round' }); },
+  chamfer() { filletDialog({ style: 'chamfer' }); },
+  'dist-hc'() { distributeCentres(0); },
+  'dist-vc'() { distributeCentres(1); },
+  spacing() { spacingDialog(); },
+  'same-w'() { sameSize(true, false); },
+  'same-h'() { sameSize(false, true); },
+  'same-size'() { sameSize(true, true); },
   'rot-cw'() { rotateSel(90); },
   'rot-ccw'() { rotateSel(-90); },
   async array() {
@@ -1337,13 +1353,57 @@ const ACTIONS = {
 function act(name) { closeMenus(); const f = ACTIONS[name]; if (f) f(); }
 $$('[data-act]').forEach(b => b.addEventListener('click', () => act(b.dataset.act)));
 
-function mirror(horizontal) {
-  const b = boundsOf(selected()); if (!b) return;
+// Mirror the selection across a line at `deg` (0 = horizontal line, 90 = vertical) through (cx, cy).
+// With copy, the originals stay and mirrored copies are added (and selected).
+function mirrorSel(deg, { copy = false, at } = {}) {
+  const objs = selected(), b = boundsOf(objs); if (!b) return msg('Select something to mirror');
+  const [cx, cy] = at || [(b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2];
+  edit(() => {
+    const list = copy ? copyObjs(objs, 0, 0) : objs;
+    for (const o of list) o.tf = reflectTf(o.tf, deg, cx, cy);
+    if (copy) S.sel = new Set(list.map(o => o.id));
+  });
+}
+function mirror(horizontal) { mirrorSel(horizontal ? 90 : 0); }
+async function mirrorLineDialog() {
+  const b = boundsOf(selected()); if (!b) return msg('Select something to mirror');
+  const v = await formDialog('Mirror across a line', [
+    { key: 'deg', label: 'Line angle (°) — 0 horizontal, 90 vertical, 45 diagonal', type: 'number', value: settings.mirrorDeg ?? 45 },
+    { key: 'through', label: 'Line passes through', type: 'select', value: 'c', options: [['c', 'Centre of selection'], ['l', 'Left edge'], ['r', 'Right edge'], ['t', 'Top edge'], ['b', 'Bottom edge'], ['xy', 'A point (X/Y below, design mm)']] },
+    { key: 'x', label: 'Point X', type: 'number', value: r3((b.minX + b.maxX) / 2) },
+    { key: 'y', label: 'Point Y', type: 'number', value: r3((b.minY + b.maxY) / 2) },
+    { key: 'copy', label: 'Keep the original (mirror a copy)', type: 'check', value: true },
+  ], { ok: 'Mirror' });
+  if (!v || !Number.isFinite(v.deg)) return;
+  settings.mirrorDeg = v.deg; saveSettings();
   const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
-  edit(() => selected().forEach(o => {
-    const t = o.tf;
-    o.tf = horizontal ? { ...t, x: 2 * cx - t.x, sx: -t.sx, r: (360 - t.r) % 360 } : { ...t, y: 2 * cy - t.y, sy: -t.sy, r: (360 - t.r) % 360 };
+  const at = { c: [cx, cy], l: [b.minX, cy], r: [b.maxX, cy], t: [cx, b.minY], b: [cx, b.maxY], xy: [v.x, v.y] }[v.through];
+  mirrorSel(v.deg, { copy: v.copy, at });
+}
+// Fillet (round) or chamfer the corners of the selected shapes. Shapes become editable paths.
+async function filletDialog(preset = {}) {
+  const objs = selected().filter(o => o.type !== 'image');
+  if (!objs.length) return msg('Select one or more shapes to round their corners');
+  const F = settings.fillet || { style: 'round', radius: 3, minTurn: 10 };
+  const v = await formDialog('Fillet / chamfer corners', [
+    { key: 'style', label: 'Corner style', type: 'select', value: preset.style || F.style, options: [['round', 'Round (fillet)'], ['chamfer', 'Straight cut (chamfer)']] },
+    { key: 'radius', label: 'Radius / chamfer size (mm)', type: 'number', value: F.radius, min: 0.01 },
+    { key: 'minTurn', label: 'Skip gentle corners that turn less than (°)', type: 'number', value: F.minTurn, min: 0, max: 179 },
+    { key: 'n', type: 'note', label: 'Each corner\'s radius shrinks if the edges next to it are too short. Curves made of many small segments are left alone by the "skip gentle corners" setting. Shapes are converted to paths; Undo restores them.' },
+  ], { ok: 'Apply' });
+  if (!v || !(v.radius > 0)) return;
+  settings.fillet = { style: v.style, radius: v.radius, minTurn: v.minTurn || 0 }; saveSettings();
+  let corners = 0;
+  edit(() => objs.forEach(o => {
+    const r = filletPolys(worldPolys(o), v.radius, { style: v.style, minTurn: v.minTurn || 0 });
+    if (!r.corners) return;
+    corners += r.corners;
+    const b = G.boundsOfPolys(r.polys), cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
+    o.type = 'path';
+    o.polys = r.polys.map(p => ({ closed: p.closed, pts: p.pts.map(([x, y]) => [x - cx, y - cy]) }));
+    o.tf = { x: cx, y: cy, sx: 1, sy: 1, r: 0 };
   }));
+  msg(corners ? `${v.style === 'chamfer' ? 'Chamfered' : 'Rounded'} ${corners} corner(s)` : 'No corners sharp enough to change', corners ? 'ok' : '');
 }
 function rotateSel(deg) {
   const b = boundsOf(selected()); if (!b) return;
@@ -1355,11 +1415,59 @@ function units(objs) {
   for (const o of objs) { const k = o.group || o.id; if (!m.has(k)) m.set(k, []); m.get(k).push(o); }
   return [...m.values()].map(list => ({ list, b: boundsOf(list) }));
 }
+// The "key" object: the first one selected (with its group). Align/size tools can use it as the reference.
+function keyUnit(us) {
+  const first = [...S.sel][0];
+  return us.find(u => u.list.some(o => o.id === first)) || us[0];
+}
+const bedBox = () => ({ minX: 0, minY: 0, maxX: dev().bedW, maxY: dev().bedH });
 function align(fn) {
-  const objs = selected(); if (!objs.length) return;
+  const objs = selected(); if (!objs.length) return msg('Select something to align');
   const us = units(objs);
-  const target = us.length === 1 ? { minX: 0, minY: 0, maxX: dev().bedW, maxY: dev().bedH } : boundsOf(objs);
-  edit(() => us.forEach(u => { const [dx, dy] = fn(u.b, target); u.list.forEach(o => { o.tf = { ...o.tf, x: o.tf.x + dx, y: o.tf.y + dy }; }); }));
+  const mode = settings.alignTo || 'auto';
+  let target, movers = us;
+  if (mode === 'bed' || (mode === 'auto' && us.length === 1)) target = bedBox();
+  else if (mode === 'key') { const k = keyUnit(us); target = k.b; movers = us.filter(u => u !== k); }
+  else target = boundsOf(objs);
+  edit(() => movers.forEach(u => { const [dx, dy] = fn(u.b, target); u.list.forEach(o => { o.tf = { ...o.tf, x: o.tf.x + dx, y: o.tf.y + dy }; }); }));
+}
+const moveUnit = (u, dx, dy) => u.list.forEach(o => { o.tf = { ...o.tf, x: o.tf.x + dx, y: o.tf.y + dy }; });
+// Spread centres evenly between the outermost centres.
+function distributeCentres(axis) {
+  const us = units(selected());
+  if (us.length < 3) return msg('Select three or more objects to distribute');
+  const c = u => axis ? (u.b.minY + u.b.maxY) / 2 : (u.b.minX + u.b.maxX) / 2;
+  us.sort((a, b) => c(a) - c(b));
+  const a = c(us[0]), step = (c(us[us.length - 1]) - a) / (us.length - 1);
+  edit(() => us.forEach((u, i) => { const d = a + step * i - c(u); moveUnit(u, axis ? 0 : d, axis ? d : 0); }));
+}
+// Exact gap between neighbours, left-to-right (or top-to-bottom), starting at the first one.
+async function spacingDialog() {
+  const us = units(selected());
+  if (us.length < 2) return msg('Select two or more objects');
+  const v = await formDialog('Set spacing', [
+    { key: 'axis', label: 'Direction', type: 'select', value: 'h', options: [['h', 'Horizontal (left → right)'], ['v', 'Vertical (top → bottom)']] },
+    { key: 'gap', label: 'Gap between objects (mm)', type: 'number', value: settings.gap ?? 5 },
+  ], { ok: 'Apply' });
+  if (!v || !Number.isFinite(v.gap)) return;
+  settings.gap = v.gap; saveSettings();
+  const ax = v.axis === 'v', lo = ax ? 'minY' : 'minX', hi = ax ? 'maxY' : 'maxX';
+  us.sort((a, b) => a.b[lo] - b.b[lo]);
+  edit(() => {
+    let pos = us[0].b[lo];
+    for (const u of us) { const d = pos - u.b[lo]; moveUnit(u, ax ? 0 : d, ax ? d : 0); pos += u.b[hi] - u.b[lo] + v.gap; }
+  });
+}
+// Make every selected object the same width and/or height as the key (first selected) object.
+function sameSize(w, h) {
+  const us = units(selected());
+  if (us.length < 2) return msg('Select two or more objects (the first one selected sets the size)');
+  const k = keyUnit(us), KW = k.b.maxX - k.b.minX, KH = k.b.maxY - k.b.minY;
+  edit(() => us.forEach(u => {
+    if (u === k) return;
+    const W = u.b.maxX - u.b.minX || 1, H = u.b.maxY - u.b.minY || 1;
+    applyScale(origOf(u.list), w ? KW / W : 1, h ? KH / H : 1, (u.b.minX + u.b.maxX) / 2, (u.b.minY + u.b.maxY) / 2);
+  }));
 }
 function distribute(axis) {
   const us = units(selected());
@@ -1655,6 +1763,45 @@ function renderPalette() {
   })));
 }
 
+// Icon toolbar for mirror / align / distribute / size / fillet, shown at the top of the Shape tab.
+const ICON = {
+  'mirror-h': '<path d="M12 3v18" stroke-dasharray="2 2"/><path d="M9 6L3 18h6zM15 6l6 12h-6z"/>',
+  'mirror-v': '<path d="M3 12h18" stroke-dasharray="2 2"/><path d="M6 9L18 3v6zM6 15l12 6v-6z"/>',
+  'mirror-copy-h': '<path d="M12 3v18" stroke-dasharray="2 2"/><path d="M10 6L4 18h6z"/><path d="M14 6l6 12h-6z" stroke-dasharray="2 1.5"/>',
+  'mirror-line': '<path d="M4 20L20 4" stroke-dasharray="2 2"/><path d="M5 5h7v7zM19 19h-7v-7z"/>',
+  'al-l': '<path d="M4 3v18"/><rect x="7" y="6" width="12" height="4"/><rect x="7" y="14" width="7" height="4"/>',
+  'al-hc': '<path d="M12 3v18"/><rect x="5" y="6" width="14" height="4"/><rect x="8" y="14" width="8" height="4"/>',
+  'al-r': '<path d="M20 3v18"/><rect x="5" y="6" width="12" height="4"/><rect x="10" y="14" width="7" height="4"/>',
+  'al-t': '<path d="M3 4h18"/><rect x="6" y="7" width="4" height="12"/><rect x="14" y="7" width="4" height="7"/>',
+  'al-vc': '<path d="M3 12h18"/><rect x="6" y="5" width="4" height="14"/><rect x="14" y="8" width="4" height="8"/>',
+  'al-b': '<path d="M3 20h18"/><rect x="6" y="5" width="4" height="12"/><rect x="14" y="10" width="4" height="7"/>',
+  'dist-h': '<path d="M3 4v16M21 4v16"/><rect x="6" y="8" width="4" height="8"/><rect x="14" y="8" width="4" height="8"/>',
+  'dist-v': '<path d="M4 3h16M4 21h16"/><rect x="8" y="6" width="8" height="4"/><rect x="8" y="14" width="8" height="4"/>',
+  'same-w': '<rect x="4" y="5" width="16" height="5"/><rect x="4" y="14" width="16" height="5"/>',
+  'same-h': '<rect x="5" y="4" width="5" height="16"/><rect x="14" y="4" width="5" height="16"/>',
+  fillet: '<path d="M4 20V11a7 7 0 0 1 7-7h9"/>',
+  chamfer: '<path d="M4 20V10l6-6h10"/>',
+};
+const ICON_TITLE = {
+  'mirror-h': 'Mirror horizontally', 'mirror-v': 'Mirror vertically', 'mirror-copy-h': 'Mirror copy to the right',
+  'mirror-line': 'Mirror across a line…', 'al-l': 'Align left edges', 'al-hc': 'Align centres (horizontally)', 'al-r': 'Align right edges',
+  'al-t': 'Align top edges', 'al-vc': 'Align centres (vertically)', 'al-b': 'Align bottom edges',
+  'dist-h': 'Distribute horizontally (equal gaps)', 'dist-v': 'Distribute vertically (equal gaps)',
+  'same-w': 'Make same width as the first selected', 'same-h': 'Make same height as the first selected',
+  fillet: 'Fillet (round) corners…', chamfer: 'Chamfer corners…',
+};
+function arrangeBar(objs) {
+  const btn = k => { const b = el('button', { type: 'button', title: ICON_TITLE[k], onclick: () => act(k) }); b.innerHTML = `<svg viewBox="0 0 24 24">${ICON[k]}</svg>`; return b; };
+  const row = (...keys) => el('div', { class: 'iconbar' }, ...keys.map(btn));
+  const alignTo = selInput(settings.alignTo || 'auto', [['auto', 'Selection (bed if one object)'], ['selection', 'Selection'], ['key', 'First selected object'], ['bed', 'Bed']],
+    v => { settings.alignTo = v; saveSettings(); });
+  return el('div', { class: 'arrange' },
+    el('div', { class: 'muted small' }, 'Mirror'), row('mirror-h', 'mirror-v', 'mirror-copy-h', 'mirror-line'),
+    el('div', { class: 'muted small' }, 'Align'), row('al-l', 'al-hc', 'al-r', 'al-t', 'al-vc', 'al-b'),
+    field('Align to', alignTo),
+    el('div', { class: 'muted small' }, 'Distribute · size · corners'), row('dist-h', 'dist-v', 'same-w', 'same-h', 'fillet', 'chamfer'));
+}
+
 function renderShape() {
   const f = $('#shape-edit');
   const objs = selected();
@@ -1675,6 +1822,7 @@ function renderShape() {
   const lockBox = chkInput(settings.lockAspect !== false, v => { settings.lockAspect = v; saveSettings(); });
   const grouped = objs.length > 1 && objs.every(o => o.group && o.group === objs[0].group);
   const kids = [
+    arrangeBar(objs),
     el('h3', {}, grouped ? `Group of ${objs.length}` : objs.length > 1 ? `${objs.length} objects` : (objs[0].name || objs[0].type)),
     el('div', { class: 'grid2' },
       field('X', numInput(r3(mx), v => moveTo(v, my))),
@@ -1895,8 +2043,8 @@ $('#m-gouser').addEventListener('click', guard(() => {
 async function userOriginDialog() {
   const d = dev(), u = d.userOrigin || S.m.wpos || [0, 0];
   const v = await formDialog('User origin', [
-    { key: 'x', label: 'X (machine mm)', type: 'number', value: +u[0].toFixed(3), step: 0.1 },
-    { key: 'y', label: 'Y (machine mm)', type: 'number', value: +u[1].toFixed(3), step: 0.1 },
+    { key: 'x', label: 'X (machine mm)', type: 'number', value: +u[0].toFixed(3) },
+    { key: 'y', label: 'Y (machine mm)', type: 'number', value: +u[1].toFixed(3) },
     { key: 'clear', label: 'Clear the user origin', type: 'check', value: false },
     { key: 'n', type: 'note', label: 'With Start from = User origin, the job anchor is placed on this point. Easiest: jog the head to the spot and press "Set user origin". Shown on the bed as a green cross.' },
   ], { ok: 'Save' });

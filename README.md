@@ -51,9 +51,12 @@ move/scale/rotate, numeric position/size/rotation, snap to grid, undo/redo.
 **Trace image** (live preview) — brightness band (cutoff → threshold), sketch/edge tracing, PNG transparency;
 ignore small specks, smoothness, optimize, detail, fade preview, delete image after tracing.
 
-**Arrange** — group/ungroup, align, distribute, centre, mirror, rotate 90°, grid array, circular array.
+**Arrange** (Arrange menu and the icon bar at the top of the Shape tab) — group/ungroup; align left/right/top/bottom/centres
+to the selection, the first-selected object or the bed; distribute by equal gaps or by centres, set exact spacing, make same
+width/height/size; mirror horizontally/vertically/both, mirror a copy, mirror across a line at any angle; centre on bed,
+rotate 90°, grid array, circular array.
 
-**Shape tools** — weld, subtract, intersect, exclude, offset (round/sharp/bevel), convert to path, break apart,
+**Shape tools** — weld, subtract, intersect, exclude, offset (round/sharp/bevel), fillet (round) and chamfer corners, convert to path, break apart,
 auto-join, close paths.
 
 **Import / export** — SVG, DXF, HPGL/PLT, PNG/JPG/BMP/GIF/WebP; export SVG, DXF, G-code, Ruida RD files.

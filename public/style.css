@@ -178,3 +178,7 @@ dialog { width: min(520px, calc(100vw - 32px)); }
 dialog .scroll { max-height: 60vh; overflow-y: auto; display: grid; gap: 6px; padding-right: 4px; }
 .fld.wide { grid-template-columns: 180px 1fr; }
 textarea.code { font: 12px/1.4 ui-monospace, monospace; min-height: 180px; }
+.arrange { display: grid; gap: 4px; padding-bottom: 8px; border-bottom: 1px solid var(--line, #3333); margin-bottom: 4px; }
+.iconbar { display: flex; flex-wrap: wrap; gap: 4px; }
+.iconbar button { width: 34px; height: 30px; padding: 3px; display: grid; place-items: center; }
+.iconbar svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }

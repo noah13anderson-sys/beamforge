@@ -159,3 +159,57 @@ export function joinPaths(polys, tol = 0.05) {
   }
   return out;
 }
+
+// ---------------------------------------------------------------- fillet / chamfer corners
+// polys: [{closed, pts}] in world mm. Rounds (or cuts) every corner that turns by at least minTurn degrees.
+// The radius shrinks automatically where an edge is too short to fit it. Open path end points are left alone.
+export function fillet(polys, radius, { style = 'round', minTurn = 10, maxTurn = 179, segDeg = 5, only } = {}) {
+  const out = [];
+  let changed = 0;
+  polys.forEach((poly, pi) => {
+    // drop repeated points (and the closing duplicate)
+    const pts = [];
+    for (const p of poly.pts) { const q = pts[pts.length - 1]; if (!q || Math.hypot(p[0] - q[0], p[1] - q[1]) > 1e-9) pts.push(p); }
+    if (poly.closed && pts.length > 2) { const a = pts[0], z = pts[pts.length - 1]; if (Math.hypot(a[0] - z[0], a[1] - z[1]) < 1e-9) pts.pop(); }
+    const n = pts.length;
+    if (n < 3 || radius <= 0) { out.push({ closed: poly.closed, pts }); return; }
+    const res = [];
+    for (let i = 0; i < n; i++) {
+      const P = pts[i];
+      const end = !poly.closed && (i === 0 || i === n - 1);
+      if (end || (only && !only(pi, i))) { res.push(P); continue; }
+      const A = pts[(i - 1 + n) % n], B = pts[(i + 1) % n];
+      const la = Math.hypot(A[0] - P[0], A[1] - P[1]), lb = Math.hypot(B[0] - P[0], B[1] - P[1]);
+      const u = [(A[0] - P[0]) / la, (A[1] - P[1]) / la], v = [(B[0] - P[0]) / lb, (B[1] - P[1]) / lb];
+      const theta = Math.acos(Math.max(-1, Math.min(1, u[0] * v[0] + u[1] * v[1]))); // interior angle
+      const turn = 180 - theta * 180 / Math.PI;
+      if (turn < minTurn || turn > maxTurn) { res.push(P); continue; }
+      // each neighbouring corner may use up to half of the shared edge (all of it at an open end)
+      const lim = Math.min(la * (!poly.closed && i === 1 ? 1 : 0.5), lb * (!poly.closed && i === n - 2 ? 1 : 0.5));
+      let t = radius / Math.tan(theta / 2);
+      if (t > lim) t = lim;
+      const r = t * Math.tan(theta / 2);
+      const T1 = [P[0] + u[0] * t, P[1] + u[1] * t], T2 = [P[0] + v[0] * t, P[1] + v[1] * t];
+      changed++;
+      if (style === 'chamfer') { res.push(T1, T2); continue; }
+      const bis = [u[0] + v[0], u[1] + v[1]], bl = Math.hypot(bis[0], bis[1]);
+      const d = r / Math.sin(theta / 2);
+      const C = [P[0] + bis[0] / bl * d, P[1] + bis[1] / bl * d];
+      let a1 = Math.atan2(T1[1] - C[1], T1[0] - C[0]), a2 = Math.atan2(T2[1] - C[1], T2[0] - C[0]);
+      let da = a2 - a1;
+      while (da > Math.PI) da -= 2 * Math.PI;
+      while (da < -Math.PI) da += 2 * Math.PI;
+      const steps = Math.max(2, Math.ceil(Math.abs(da) * 180 / Math.PI / segDeg));
+      for (let k = 0; k <= steps; k++) { const a = a1 + da * k / steps; res.push([C[0] + r * Math.cos(a), C[1] + r * Math.sin(a)]); }
+    }
+    out.push({ closed: poly.closed, pts: res });
+  });
+  return { polys: out, corners: changed };
+}
+
+// Reflection of an object transform {x, y, sx, sy, r} across a line through (cx, cy) at angle deg.
+export function reflectTf(tf, deg, cx, cy) {
+  const t = 2 * deg * Math.PI / 180, c = Math.cos(t), s = Math.sin(t);
+  const dx = tf.x - cx, dy = tf.y - cy;
+  return { ...tf, x: cx + c * dx + s * dy, y: cy + s * dx - c * dy, sy: -tf.sy, r: (((2 * deg - tf.r) % 360) + 360) % 360 };
+}

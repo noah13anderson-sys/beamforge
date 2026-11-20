@@ -101,6 +101,35 @@ for (const t of ['grbl', 'smoothie', 'marlin']) {
   const g = frameGcode(d, [[0, 0], [10, 0], [10, 10]], 1, 3000);
   ok(`frame ${t}`, g.includes('G1 X0 Y0') && (t === 'smoothie' ? !/M[35]/.test(g) : /M5/.test(g)), g.split('\n').slice(3, 4).join(''));
 }
+// --- fillet / chamfer / reflect
+{ const sqp = [{ closed: true, pts: [[0, 0], [20, 0], [20, 20], [0, 20]] }];
+  const f = O.fillet(sqp, 5);
+  const pts = f.polys[0].pts;
+  const onArc = pts.every(([x, y]) => x >= -1e-9 && x <= 20 + 1e-9 && y >= -1e-9 && y <= 20 + 1e-9);
+  const corner = Math.min(...pts.map(([x, y]) => Math.hypot(x, y)));
+  ok('fillet rounds 4 corners', f.corners === 4 && onArc, String(f.corners));
+  ok('fillet r=5 corner inset is 5√2−5', Math.abs(corner - (Math.hypot(5, 5) - 5)) < 0.05, corner.toFixed(3));
+  const c = O.fillet(sqp, 5, { style: 'chamfer' }).polys[0].pts;
+  ok('chamfer makes 8 points', c.length === 8 && c.some(p => Math.abs(p[0] - 5) < 1e-9 && Math.abs(p[1]) < 1e-9), JSON.stringify(c.slice(0, 2)));
+  const big = O.fillet(sqp, 100).polys[0].pts;
+  ok('fillet radius clamps to edge (circle-ish)', big.every(([x, y]) => Math.abs(Math.hypot(x - 10, y - 10) - 10) < 0.01), '');
+  const circ = { closed: true, pts: Array.from({ length: 72 }, (_, i) => [Math.cos(i * Math.PI / 36), Math.sin(i * Math.PI / 36)]) };
+  ok('fillet skips smooth curves', O.fillet([circ], 1).corners === 0);
+  const open = O.fillet([{ closed: false, pts: [[0, 0], [10, 0], [10, 10]] }], 2);
+  ok('open path keeps end points', open.corners === 1 && open.polys[0].pts[0].join() === '0,0' && open.polys[0].pts.at(-1).join() === '10,10');
+  const G2 = await import(base + 'geom.js');
+  const tf = { x: 30, y: 10, sx: 1.5, sy: 0.5, r: 25 };
+  for (const deg of [0, 90, 45, 120]) {
+    const R = O.reflectTf(tf, deg, 5, 7), t = 2 * deg * Math.PI / 180;
+    const refl = ([x, y]) => { const dx = x - 5, dy = y - 7; return [5 + Math.cos(t) * dx + Math.sin(t) * dy, 7 + Math.sin(t) * dx - Math.cos(t) * dy]; };
+    let good = true;
+    for (const p of [[1, 2], [-3, 4], [0, 0]]) {
+      const a = refl(G2.apply(G2.tfMatrix(tf), ...p)), b = G2.apply(G2.tfMatrix(R), ...p);
+      if (Math.hypot(a[0] - b[0], a[1] - b[1]) > 1e-9) good = false;
+    }
+    ok(`reflectTf matches true reflection at ${deg}°`, good);
+  }
+}
 // --- variable text resolve
 const Sh = await import(base + 'shapes.js');
 Sh.textVars.serial = 7;
