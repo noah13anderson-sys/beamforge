@@ -10,10 +10,13 @@ Node.js server talks to the laser over USB or the network. No npm packages are n
 ## Run
 
 ```bash
-./beamforge          # starts the server (if needed) and opens http://localhost:8787
+./beamforge          # opens BeamForge in its own app window
 ```
 
-Requires Node.js 18+ and a modern browser. Pick **Virtual laser** in the Laser tab to try everything without hardware.
+BeamForge runs as a desktop app: its own window (GTK + WebKit), normal Open/Save dialogs, and no browser tabs or
+address bar. Requires Node.js 18+ and WebKitGTK with Python bindings (Arch: `pacman -S webkit2gtk-4.1 python-gobject`).
+If those are missing, or with `BEAMFORGE_BROWSER=1 ./beamforge`, it opens in Firefox at http://localhost:8787 instead.
+Closing the window never stops a running job. `BEAMFORGE_DEVTOOLS=1` turns on the web inspector (right-click → Inspect). Pick **Virtual laser** in the Laser tab to try everything without hardware.
 
 ## Supported controllers
 

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Start BeamForge (if it isn't already running) and open it in a browser window.
+# Start BeamForge in its own app window (GTK + WebKit). Falls back to a browser window
+# only if the WebKit runtime isn't installed (Arch: pacman -S webkit2gtk-4.1 python-gobject).
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
+if [ -z "$BEAMFORGE_BROWSER" ] && python3 -c "import gi; gi.require_version('WebKit2','4.1')" 2>/dev/null; then
+  exec python3 desktop/beamforge-app.py "$@"
+fi
 PORT="${BEAMFORGE_PORT:-8787}"
 URL="http://localhost:$PORT"
 LOG="${XDG_STATE_HOME:-$HOME/.local/state}/beamforge.log"
