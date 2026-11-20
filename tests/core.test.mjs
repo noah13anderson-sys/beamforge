@@ -70,6 +70,16 @@ for (const [o, exX, exY] of [['bl', [40, 60], [340, 360]], ['tl', [40, 60], [40,
   const f = jobFrame({ layers: [L()], objects: [sq] }, d, { startFrom: 'current', anchor: 'c', position: [5, 5] });
   const cx = (Math.min(...f.map(p => p[0])) + Math.max(...f.map(p => p[0]))) / 2, cy = (Math.min(...f.map(p => p[1])) + Math.max(...f.map(p => p[1]))) / 2;
   ok('anchor centre at head', cx === 5 && cy === 5); }
+// --- user origin
+{ const d = D.makeDevice('grbl', { userOrigin: [100, 50] });
+  const f = jobFrame({ layers: [L()], objects: [sq] }, d, { startFrom: 'user', anchor: 'bl', position: [5, 5] });
+  ok('user origin anchors bottom-left', Math.min(...f.map(p => p[0])) === 100 && Math.min(...f.map(p => p[1])) === 50, JSON.stringify(f));
+  const g = generateJob({ layers: [L()], objects: [sq] }, d, { startFrom: 'user', anchor: 'bl' }).gcode;
+  ok('user origin: return to it at end', /G0 X100(\.0+)? Y50(\.0+)?\s*$/.test(g.trim().split('\n').pop()), g.trim().split('\n').pop());
+  const r = D.makeDevice('ruida', { bedW: 1300, bedH: 900, userOrigin: [600, 400] });
+  const fr = jobFrame({ layers: [L()], objects: [sq] }, r, { startFrom: 'user', anchor: 'c' });
+  const rcx = (Math.min(...fr.map(p => p[0])) + Math.max(...fr.map(p => p[0]))) / 2;
+  ok('user origin on Ruida (rear-right origin)', rcx === 600, String(rcx)); }
 // --- air assist variants
 { ok('air M7', job(D.makeDevice('grbl', { air: 'M7' })).gcode.includes('M7 ; air'));
   ok('air none', !/M[789]/.test(job(D.makeDevice('grbl', { air: 'none' })).gcode)); }

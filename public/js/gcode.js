@@ -283,14 +283,16 @@ export function jobBounds(groups) {
 }
 
 // Offset added to machine coordinates so the job's anchor (as seen on screen) lands on the head position.
+// "current" anchors to the head position; "user" anchors to the device's saved user origin.
+export const startPoint = (cfg, opts) => opts.startFrom === 'user' ? (cfg.userOrigin || [0, 0]) : (opts.position || [0, 0]);
 export function jobOffset(b, cfg, opts) {
-  if (opts.startFrom !== 'current' || !b) return [0, 0];
+  if ((opts.startFrom !== 'current' && opts.startFrom !== 'user') || !b) return [0, 0];
   const design = {
     bl: [b.minX, b.maxY], br: [b.maxX, b.maxY], tl: [b.minX, b.minY], tr: [b.maxX, b.minY],
     c: [(b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2],
   }[opts.anchor] || [b.minX, b.maxY];
   const [ax, ay] = mapToMachine(cfg, design[0], design[1]);
-  const [px, py] = opts.position || [0, 0];
+  const [px, py] = startPoint(cfg, opts);
   return [px - ax, py - ay];
 }
 
@@ -363,7 +365,7 @@ export function generateJob(doc, cfg, opts = {}) {
   if (prof.power !== 'inline') em.line('M5 ; laser off');
   if (air) em.line('M9');
   if (cfg.returnHome) {
-    const home = opts.startFrom === 'current' ? (opts.position || [0, 0]) : [0, 0];
+    const home = opts.startFrom === 'absolute' || !opts.startFrom ? [0, 0] : startPoint(cfg, opts);
     em.line(`G0 X${fmt(home[0])} Y${fmt(home[1])}`);
   }
   return { ...result(em), gcode: em.out.join('\n') + '\n' };

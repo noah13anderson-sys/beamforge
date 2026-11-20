@@ -91,6 +91,7 @@
         <hr>
         <button data-act="library">Material library…</button>
         <button data-act="goto-sel">Move laser to selection</button>
+        <button data-act="user-origin">User origin…</button>
       </div>
     </div>
   </nav>
@@ -179,13 +180,15 @@
         <button id="m-unlock" title="Clear alarm / resume after halt">Unlock</button>
         <button id="m-setorigin" title="Make the current position X0 Y0">Set origin</button>
         <button id="m-goorigin" title="Move to X0 Y0">Go to origin</button>
+        <button id="m-setuser" title="Remember the head's current position as the user origin (used when Start from = User origin)">Set user origin</button>
+        <button id="m-gouser" title="Move the head to the user origin">Go to user origin</button>
         <button id="m-gosel" title="Move the head to the centre of the selection">Go to selection</button>
         <button id="m-pulse" title="Short low-power pulse to find the beam">Test fire</button>
       </div>
       <div id="m-macros" class="row wrap gap"></div>
       <h3>Job</h3>
       <div class="form">
-        <label class="fld"><span>Start from</span><select id="j-start"><option value="absolute">Absolute coords</option><option value="current">Current position</option></select></label>
+        <label class="fld"><span>Start from</span><select id="j-start"><option value="absolute">Absolute coords</option><option value="current">Current position</option><option value="user">User origin</option></select></label>
         <label class="fld" id="j-anchor-wrap"><span>Job anchor</span><select id="j-anchor"><option value="bl">Bottom-left</option><option value="tl">Top-left</option><option value="tr">Top-right</option><option value="br">Bottom-right</option><option value="c">Centre</option></select></label>
         <label class="fld chk"><input type="checkbox" id="j-selonly"><span>Cut selected graphics only</span></label>
         <label class="fld chk"><input type="checkbox" id="j-rubber"><span>Rubber-band frame (convex outline)</span></label>

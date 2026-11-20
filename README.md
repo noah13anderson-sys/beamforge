@@ -67,7 +67,7 @@ Stucki, Atkinson, ordered, halftone, threshold, grayscale (G-code devices); brig
 
 **Machine** — connect, live position, jog in screen directions, home, unlock, set/go to origin, go to selection,
 test fire, macros, GRBL `$$` editor, frame (box or rubber-band), **dry run**, **power limit**, refuses cuts outside
-the work area (Ruida), start from absolute or current position, rotary, pause/resume/stop, console (hex bytes for
+the work area (Ruida), start from absolute coords, current position or a saved **user origin** (with job anchor), rotary, pause/resume/stop, console (hex bytes for
 Ruida).
 
 ## Not supported

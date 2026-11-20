@@ -348,6 +348,14 @@ function draw() {
     ctx.stroke(); ctx.setLineDash([]);
   }
 
+  if (d.userOrigin) {
+    const [ux, uy] = machineToDesign(d, d.userOrigin[0], d.userOrigin[1]);
+    const r = 7 * px;
+    ctx.strokeStyle = settings.startFrom === 'user' ? '#30a46c' : 'rgba(48,164,108,0.45)'; ctx.lineWidth = 1.5 * px;
+    ctx.beginPath(); ctx.moveTo(ux, uy - r); ctx.lineTo(ux + r, uy); ctx.lineTo(ux, uy + r); ctx.lineTo(ux - r, uy); ctx.closePath();
+    ctx.moveTo(ux - 2 * r, uy); ctx.lineTo(ux + 2 * r, uy); ctx.moveTo(ux, uy - 2 * r); ctx.lineTo(ux, uy + 2 * r);
+    ctx.stroke();
+  }
   if (S.m.connected && S.m.wpos) {
     const [hx, hy] = machineToDesign(d, S.m.wpos[0], S.m.wpos[1]);
     ctx.strokeStyle = '#e5484d'; ctx.lineWidth = 1.5 * px;
@@ -1324,6 +1332,7 @@ const ACTIONS = {
   library: libraryDialog,
   'machine-settings': () => machineSettingsDialog(),
   'goto-sel': () => gotoSelection(),
+  'user-origin': () => userOriginDialog(),
 };
 function act(name) { closeMenus(); const f = ACTIONS[name]; if (f) f(); }
 $$('[data-act]').forEach(b => b.addEventListener('click', () => act(b.dataset.act)));
@@ -1730,8 +1739,12 @@ function jobOpts() {
   };
 }
 const docData = () => ({ layers: S.layers, objects: S.objects });
-function buildJob() {
+function checkStart() {
   if (settings.startFrom === 'current' && !S.m.wpos) throw new Error('Connect to the laser first so the current position is known');
+  if (settings.startFrom === 'user' && !dev().userOrigin) throw new Error('No user origin set — jog the head to the spot and press "Set user origin" (or Laser → User origin…)');
+}
+function buildJob() {
+  checkStart();
   return generateJob(docData(), dev(), jobOpts());
 }
 function buildPreview() {
@@ -1804,7 +1817,7 @@ function updateDro() {
 function updateMachineUI() {
   $('#m-connect').textContent = S.m.connected ? 'Disconnect' : 'Connect';
   $('#m-connect').classList.toggle('primary', !S.m.connected);
-  for (const id of ['m-home', 'm-unlock', 'm-setorigin', 'm-goorigin', 'm-gosel', 'm-pulse', 'j-frame', 'j-frame-on', 'j-start-btn', 'j-pause', 'j-resume', 'j-stop'])
+  for (const id of ['m-home', 'm-unlock', 'm-setorigin', 'm-goorigin', 'm-setuser', 'm-gouser', 'm-gosel', 'm-pulse', 'j-frame', 'j-frame-on', 'j-start-btn', 'j-pause', 'j-resume', 'j-stop'])
     $('#' + id).disabled = !S.m.connected;
   if (isRuida()) { // these are done on the Ruida's own control panel
     for (const id of ['m-unlock', 'm-setorigin', 'm-goorigin', 'm-pulse', 'j-frame-on']) { $('#' + id).disabled = true; $('#' + id).title = 'Use the laser\'s control panel for this on Ruida machines'; }
@@ -1866,6 +1879,33 @@ $('#m-unlock').addEventListener('click', guard(() => machine.send(C().unlock)));
 $('#m-setorigin').addEventListener('click', guard(() => machine.send(C().setOrigin)));
 $('#m-goorigin').addEventListener('click', guard(() => machine.send(C().goOrigin)));
 $('#m-gosel').addEventListener('click', () => gotoSelection());
+function setUserOrigin(pt) {
+  dev().userOrigin = pt; saveSettings(); changed(); requestDraw();
+  msg(pt ? `User origin set to X ${pt[0].toFixed(2)}, Y ${pt[1].toFixed(2)}` : 'User origin cleared', 'ok');
+}
+$('#m-setuser').addEventListener('click', guard(() => {
+  if (!S.m.wpos) throw new Error('Position not known yet');
+  setUserOrigin([S.m.wpos[0], S.m.wpos[1]]);
+  if (settings.startFrom !== 'user') { settings.startFrom = 'user'; $('#j-start').value = 'user'; saveSettings(); syncAnchor(); }
+}));
+$('#m-gouser').addEventListener('click', guard(() => {
+  const u = dev().userOrigin; if (!u) throw new Error('No user origin set');
+  return isRuida() ? machine.ruida('goto', { x: u[0], y: u[1] }) : machine.send(C().goTo(u[0], u[1]));
+}));
+async function userOriginDialog() {
+  const d = dev(), u = d.userOrigin || S.m.wpos || [0, 0];
+  const v = await formDialog('User origin', [
+    { key: 'x', label: 'X (machine mm)', type: 'number', value: +u[0].toFixed(3), step: 0.1 },
+    { key: 'y', label: 'Y (machine mm)', type: 'number', value: +u[1].toFixed(3), step: 0.1 },
+    { key: 'clear', label: 'Clear the user origin', type: 'check', value: false },
+    { key: 'n', type: 'note', label: 'With Start from = User origin, the job anchor is placed on this point. Easiest: jog the head to the spot and press "Set user origin". Shown on the bed as a green cross.' },
+  ], { ok: 'Save' });
+  if (!v) return;
+  if (v.clear) return setUserOrigin(null);
+  if (!Number.isFinite(v.x) || !Number.isFinite(v.y)) return msg('Enter X and Y', 'err');
+  setUserOrigin([v.x, v.y]);
+  settings.startFrom = 'user'; $('#j-start').value = 'user'; saveSettings(); syncAnchor();
+}
 $('#m-pulse').addEventListener('click', guard(async () => {
   for (const step of C().pulse(settings.pulsePower, settings.pulseMs)) {
     if (step.delay) await sleep(step.delay);
@@ -1907,7 +1947,7 @@ async function machineSettingsDialog() {
 
 $('#j-start').value = settings.startFrom;
 $('#j-anchor').value = settings.anchor;
-const syncAnchor = () => { $('#j-anchor-wrap').style.display = settings.startFrom === 'current' ? '' : 'none'; };
+const syncAnchor = () => { $('#j-anchor-wrap').style.display = settings.startFrom === 'absolute' ? 'none' : ''; requestDraw(); };
 syncAnchor();
 $('#j-start').addEventListener('change', e => { settings.startFrom = e.target.value; saveSettings(); syncAnchor(); changed(); });
 $('#j-anchor').addEventListener('change', e => { settings.anchor = e.target.value; saveSettings(); changed(); });
@@ -1915,12 +1955,13 @@ $('#j-selonly').addEventListener('change', () => changed());
 
 function frameCode(withBeam) {
   const opts = jobOpts();
-  if (opts.startFrom === 'current' && !S.m.wpos) throw new Error('Current position unknown');
+  checkStart();
   const pts = jobFrame(docData(), dev(), opts, $('#j-rubber').checked);
   return frameGcode(dev(), pts, withBeam ? settings.framePower : 0, +$('#m-jogf').value || 3000);
 }
 $('#j-frame').addEventListener('click', guard(async () => {
   if (!isRuida()) return machine.send(frameCode(false));
+  checkStart();
   const opts = jobOpts();
   await machine.ruida('frame', { pts: jobFrame(docData(), dev(), opts, $('#j-rubber').checked) });
 }));
