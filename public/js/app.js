@@ -1724,7 +1724,7 @@ stage.addEventListener('drop', async e => {
 async function importFile(f) {
   try {
     const ext = f.name.split('.').pop().toLowerCase();
-    if (ext === 'svg') importSvg(await readFile(f), f.name);
+    if (ext === 'svg') await importSvg(await readFile(f), f.name);
     else if (ext === 'dxf') importDxf(await readFile(f), f.name);
     else if (ext === 'plt' || ext === 'hpgl') importPlt(await readFile(f), f.name);
     else if (f.type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp'].includes(ext)) await importImage(await readFile(f, 'url'), f.name);
@@ -1742,24 +1742,39 @@ function nearestPalette(cssColor) {
   return best;
 }
 
-function placeImported(groups, name) { // groups: [{polys(world mm), color, mode}]
+// groups: [{polys(world mm), color, mode}]; images: [{src, key, cx, cy, w, h, r, flip}] embedded bitmaps (world mm)
+function placeImported(groups, name, images = []) {
   let b = G.emptyBounds();
   for (const g of groups) b = G.boundsOfPolys(g.polys, b);
-  if (!G.boundsValid(b)) throw new Error('No usable shapes found');
+  for (const im of images) {
+    const c = Math.cos(im.r * G.D2R), s = Math.sin(im.r * G.D2R), hw = im.w / 2, hh = im.h / 2;
+    b = G.boundsOfPolys([{ pts: [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => [im.cx + c * x - s * y, im.cy + s * x + c * y]) }], b);
+  }
+  if (!G.boundsValid(b)) throw new Error('No usable shapes or images found');
   const dx = dev().bedW / 2 - (b.minX + b.maxX) / 2, dy = dev().bedH / 2 - (b.minY + b.maxY) / 2;
-  const gid = groups.length > 1 ? uid() : undefined;
+  const gid = groups.length + images.length > 1 ? uid() : undefined;
   edit(() => {
     S.sel.clear();
+    if (images.length) {
+      const IL = S.layers.find(l => l.mode === 'image') || layerForColor(PALETTE[5], 'image');
+      IL.mode = 'image';
+      for (const im of images) {
+        const o = addObject({ type: 'image', name: images.length > 1 ? `${name} image` : name, src: im.src, imgKey: im.key, w: im.w, h: im.h,
+          brightness: 100, contrast: 100, gamma: 1, invert: false, layer: IL.id, group: gid,
+          tf: { x: im.cx + dx, y: im.cy + dy, sx: 1, sy: im.flip ? -1 : 1, r: im.r } });
+        S.sel.add(o.id);
+      }
+    }
     for (const g of groups) {
       const L = g.color ? layerForColor(g.color, g.mode) : activeLayer();
       const o = pathFromWorld(g.polys.map(p => ({ closed: p.closed, pts: p.pts.map(([x, y]) => [x + dx, y + dy]) })), { name, layer: L.id, group: gid });
       S.sel.add(o.id);
     }
   });
-  msg(`Imported ${name}: ${r3(b.maxX - b.minX)} × ${r3(b.maxY - b.minY)} mm`, 'ok');
+  msg(`Imported ${name}: ${r3(b.maxX - b.minX)} × ${r3(b.maxY - b.minY)} mm${images.length ? ` (${images.length} image${images.length > 1 ? 's' : ''} — select it and use Tools → Trace image to make vectors)` : ''}`, 'ok');
 }
 
-function importSvg(text, name) {
+async function importSvg(text, name) {
   const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
   const src = doc.documentElement;
   if (!src || src.nodeName.toLowerCase() !== 'svg') throw new Error('Not a valid SVG');
@@ -1776,6 +1791,41 @@ function importSvg(text, name) {
     const origin = svg.getBoundingClientRect();
     const k = 25.4 / 96; // CSS px -> mm
     const groups = new Map();
+    // Embedded bitmaps (<image>): common in "SVG" files that are really a picture. Keep them so they can be traced.
+    const images = [], skipped = [];
+    for (const node of svg.querySelectorAll('image')) {
+      if (node.closest('defs, clipPath, mask, symbol, marker, pattern')) continue;
+      if (getComputedStyle(node).display === 'none') continue;
+      const href = node.getAttribute('href') || node.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || '';
+      if (!/^data:image\//i.test(href)) { skipped.push(href.slice(0, 60) || '(empty)'); continue; }
+      const m = node.getScreenCTM(); if (!m) continue;
+      const x = node.x.baseVal.value, y = node.y.baseVal.value;
+      let w = node.width.baseVal.value, h = node.height.baseVal.value;
+      const key = uid();
+      let img;
+      try { img = await loadImage(key, href); } catch { skipped.push('(unreadable image data)'); continue; }
+      if (!w && !h) { w = img.naturalWidth; h = img.naturalHeight; } else if (!w) w = h * img.naturalWidth / img.naturalHeight; else if (!h) h = w * img.naturalHeight / img.naturalWidth;
+      // preserveAspectRatio (default xMidYMid meet): the picture is fitted inside the box, centred
+      let bx = x, by = y, bw = w, bh = h;
+      const par = (node.getAttribute('preserveAspectRatio') || 'xMidYMid meet').trim();
+      if (!/^none/.test(par) && img.naturalWidth && img.naturalHeight) {
+        const ar = img.naturalWidth / img.naturalHeight;
+        const slice = /slice/.test(par);
+        if ((w / h > ar) !== slice) { bw = h * ar; } else { bh = w / ar; }
+        const al = /x(Min|Mid|Max)Y(Min|Mid|Max)/.exec(par) || [0, 'Mid', 'Mid'];
+        bx = x + (w - bw) * { Min: 0, Mid: 0.5, Max: 1 }[al[1]];
+        by = y + (h - bh) * { Min: 0, Mid: 0.5, Max: 1 }[al[2]];
+      }
+      const lcx = bx + bw / 2, lcy = by + bh / 2;
+      const sx = Math.hypot(m.a, m.b) * k, sy = Math.hypot(m.c, m.d) * k;
+      images.push({
+        src: href, key,
+        cx: (m.a * lcx + m.c * lcy + m.e - origin.left) * k, cy: (m.b * lcx + m.d * lcy + m.f - origin.top) * k,
+        w: bw * sx, h: bh * sy, r: Math.atan2(m.b, m.a) / G.D2R, flip: m.a * m.d - m.b * m.c < 0,
+      });
+    }
+    if (skipped.length && !images.length && !svg.querySelector('path, rect, circle, ellipse, line, polyline, polygon'))
+      throw new Error(`The picture in this SVG is linked to a separate file (${skipped[0]}), not stored inside it. Import that picture file directly instead.`);
     for (const node of svg.querySelectorAll('path, rect, circle, ellipse, line, polyline, polygon')) {
       if (node.closest('defs, clipPath, mask, symbol, marker, pattern')) continue;
       const cs = getComputedStyle(node);
@@ -1809,7 +1859,8 @@ function importSvg(text, name) {
       if (!groups.has(key)) groups.set(key, { polys: [], color, mode });
       groups.get(key).polys.push(...polys);
     }
-    placeImported([...groups.values()], name);
+    placeImported([...groups.values()], name, images);
+    if (skipped.length) msg(`${name}: ${skipped.length} linked image(s) could not be imported — import those picture files directly`, 'err');
   } finally { host.remove(); }
 }
 

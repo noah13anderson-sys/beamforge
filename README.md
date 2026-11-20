@@ -79,7 +79,7 @@ rotate 90°, grid array, circular array.
 **Shape tools** — weld, subtract, intersect, exclude, offset (round/sharp/bevel), fillet (round) and chamfer corners, convert to path, break apart,
 auto-join, close paths.
 
-**Import / export** — SVG, DXF, HPGL/PLT, PNG/JPG/BMP/GIF/WebP; export SVG, DXF, G-code, Ruida RD files.
+**Import / export** — SVG (including pictures embedded in SVG files, ready to trace), DXF, HPGL/PLT, PNG/JPG/BMP/GIF/WebP; export SVG, DXF, G-code, Ruida RD files.
 
 **Cut layers** — Line, Fill, Offset fill, Image; speed, power, passes, air assist, output on/off, run order,
 constant-power override, Z offset/step per pass. Line: kerf compensation, tabs, perforation, holes before outlines.
