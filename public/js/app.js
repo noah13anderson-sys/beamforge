@@ -2,8 +2,10 @@
 import * as G from './geom.js';
 import { worldPolys, worldPath, objBounds, hitObject, localPolys, textVars, resolveText } from './shapes.js';
 import { generateJob, jobFrame, frameGcode } from './gcode.js';
-import { loadImage, getImage, imageSource, imageFilter, traceImage } from './raster.js';
-import { offset as offsetPolys, boolean as booleanOp, joinPaths, fillet as filletPolys, reflectTf } from './ops.js';
+import { loadImage, getImage, imageSource, imageFilter, traceImage, makeCanvas, traceSize, traceRaster, traceValues, loopsToLocal, autoTrace } from './raster.js';
+import { offset as offsetPolys, boolean as booleanOp, joinPaths, fillet as filletPolys, reflectTf, hull, closeWithin, optimizePolys,
+  polysKey, polysInside, samplePath, dockBoxes, breakAt, removeSegment } from './ops.js';
+import { openMenu, closeMenu, isMenuOpen, menuAnchor } from './menu.js';
 import { DEVICE_TYPES, ORIGINS, GRBL_SETTINGS, isCnc, makeDevice, family, toMachine, mapToMachine, machineToDesign, rotaryScale, commands, screenToMachineDelta } from './devices.js';
 import { swizzle } from './ruida.js';
 import { qrEncode, qrRects } from './qr.js';
@@ -95,12 +97,12 @@ const S = {
   tool: 'select', view: { s: 2, ox: 40, oy: 40 },
   previewOn: false, preview: null, previewT: 1,
   m: { connected: false, port: null, state: '—', wpos: null, job: null, server: false },
-  undo: [], redo: [], clipboard: null, draft: null, cursor: null, node: null, measure: null,
+  undo: [], redo: [], clipboard: null, clipShift: 0, draft: null, cursor: null, node: null, measure: null, flash: null,
 };
 
 function layerDefaults(mode = 'line') {
   return {
-    mode, output: true,
+    mode, output: true, show: true,
     speed: mode === 'line' ? 10 : 120, power: mode === 'line' ? 80 : 35, minPower: 0, passes: 1,
     interval: 0.1, overscan: 2.5, bidir: true, angle: 0, crosshatch: false, air: mode === 'line',
     dither: 'floyd', threshold: 128, halftoneCell: 6, halftoneAngle: 45,
@@ -153,6 +155,24 @@ function withGroups(ids) {
   const groups = new Set(S.objects.filter(o => out.has(o.id) && o.group).map(o => o.group));
   if (groups.size) for (const o of S.objects) if (o.group && groups.has(o.group)) out.add(o.id);
   return out;
+}
+// Hidden layers (Show off) are not drawn and can't be clicked, but still burn when their Output is on.
+const shown = o => layerById(o.layer)?.show !== false;
+const visibleObjects = () => S.objects.filter(shown);
+// Locked shapes can be selected and copied, but not moved, resized, changed or deleted.
+function blockLocked(objs, what = 'changed') {
+  const n = objs.filter(o => o.locked).length;
+  if (!n) return false;
+  msg(`${n === 1 ? 'A locked shape' : `${n} locked shapes`} can't be ${what}. Right-click → Unlock selected shapes first.`, 'err');
+  return true;
+}
+// Move units (a unit = one object or one group) by [unit, dx, dy]; refuses if a locked shape would move.
+function moveUnits(moves, what = 'moved') {
+  const moving = moves.filter(([, dx, dy]) => Math.abs(dx) > 1e-9 || Math.abs(dy) > 1e-9);
+  if (!moving.length) return false;
+  if (blockLocked(moving.flatMap(([u]) => u.list), what)) return false;
+  edit(() => moving.forEach(([u, dx, dy]) => moveUnit(u, dx, dy)));
+  return true;
 }
 
 // ================================================================ undo / change tracking
@@ -263,6 +283,14 @@ function zoomFit() {
   S.view.oy = (r.height - d.bedH * S.view.s) / 2;
   requestDraw();
 }
+function zoomToBox(b) {
+  const r = stage.getBoundingClientRect(), pad = 48;
+  const w = Math.max(b.maxX - b.minX, 0.5), h = Math.max(b.maxY - b.minY, 0.5);
+  S.view.s = clamp(Math.min((r.width - pad * 2) / w, (r.height - pad * 2) / h), 0.05, 400);
+  S.view.ox = r.width / 2 - (b.minX + b.maxX) / 2 * S.view.s;
+  S.view.oy = r.height / 2 - (b.minY + b.maxY) / 2 * S.view.s;
+  requestDraw();
+}
 function zoomAt(sx, sy, k) {
   const [wx, wy] = toWorld(sx, sy);
   S.view.s = clamp(S.view.s * k, 0.05, 400);
@@ -311,7 +339,7 @@ function draw() {
   const pv = S.previewOn && S.preview;
   for (const o of S.objects) {
     const L = layerById(o.layer);
-    if (!L) continue;
+    if (!L || L.show === false) continue;
     ctx.globalAlpha = (L.output ? 1 : 0.35) * (pv ? 0.35 : 1);
     if (o.type === 'image') {
       const img = imageSource(o);
@@ -332,6 +360,10 @@ function draw() {
     ctx.stroke(p); ctx.setLineDash([]);
   }
   ctx.globalAlpha = 1;
+  if (S.flash && S.flash.on) { // "Flash the content on this layer" (shown even when the layer is hidden)
+    ctx.strokeStyle = colors.sel; ctx.lineWidth = 3 * px;
+    for (const o of S.objects) if (o.layer === S.flash.layer) ctx.stroke(worldPath(o));
+  }
   if (pv) drawPreview(px);
 
   const dr = S.draft;
@@ -374,19 +406,22 @@ function draw() {
   // overlays in screen space
   if (!pv && S.tool === 'node') drawNodes();
   else if (!pv) {
-    const b = boundsOf(selected());
+    const sel = selected(), b = boundsOf(sel);
     if (b) {
-      const hp = handlePoints(b);
-      ctx.strokeStyle = colors.sel; ctx.lineWidth = 1; ctx.setLineDash([5, 4]);
+      const hp = handlePoints(b), locked = sel.some(o => o.locked);
+      ctx.strokeStyle = locked ? colors.muted : colors.sel; ctx.lineWidth = 1; ctx.setLineDash([5, 4]);
       ctx.strokeRect(hp[0][0], hp[0][1], hp[2][0] - hp[0][0], hp[2][1] - hp[0][1]);
       ctx.setLineDash([]);
-      ctx.beginPath(); ctx.moveTo(hp[4][0], hp[4][1]); ctx.lineTo(hp[8][0], hp[8][1]); ctx.stroke();
-      ctx.fillStyle = '#fff';
-      hp.forEach(([x, y], i) => {
-        ctx.beginPath();
-        if (i === 8) ctx.arc(x, y, 5, 0, Math.PI * 2); else ctx.rect(x - 4, y - 4, 8, 8);
-        ctx.fill(); ctx.stroke();
-      });
+      if (locked) drawPadlock(hp[1][0] + 3, hp[1][1] - 3); // no handles: locked shapes can't be resized or rotated
+      else {
+        ctx.beginPath(); ctx.moveTo(hp[4][0], hp[4][1]); ctx.lineTo(hp[8][0], hp[8][1]); ctx.stroke();
+        ctx.fillStyle = '#fff';
+        hp.forEach(([x, y], i) => {
+          ctx.beginPath();
+          if (i === 8) ctx.arc(x, y, 5, 0, Math.PI * 2); else ctx.rect(x - 4, y - 4, 8, 8);
+          ctx.fill(); ctx.stroke();
+        });
+      }
     }
   }
   if (drag && drag.kind === 'marquee') {
@@ -401,6 +436,13 @@ function draw() {
   drawRulers(r.width, r.height);
 }
 
+function drawPadlock(x, y) { // bottom-left corner at x, y (screen px)
+  ctx.save();
+  ctx.fillStyle = colors.muted; ctx.strokeStyle = colors.muted; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.arc(x + 5, y - 8, 3.2, Math.PI, 0); ctx.stroke();
+  ctx.fillRect(x, y - 8, 10, 8);
+  ctx.restore();
+}
 function drawNodes() {
   ctx.lineWidth = 1;
   for (const o of selected()) {
@@ -475,7 +517,8 @@ function hitTest(x, y) {
   const tol = 5 / S.view.s;
   for (let i = S.objects.length - 1; i >= 0; i--) {
     const o = S.objects[i], L = layerById(o.layer);
-    if (hitObject(o, x, y, tol, L && L.mode !== 'line')) return o;
+    if (!L || L.show === false) continue;
+    if (hitObject(o, x, y, tol, L.mode !== 'line')) return o;
   }
   return null;
 }
@@ -514,6 +557,7 @@ function nodeHit(sx, sy) {
 function ensurePath(o) { if (o.type !== 'path') { o.polys = localPolys(o); o.type = 'path'; } }
 
 cv.addEventListener('pointerdown', e => {
+  if (e.button === 2) return; // right button: the context menu (no pointer capture, so the menu gets the pointer)
   cv.setPointerCapture(e.pointerId);
   const [wx, wy] = toWorld(e.offsetX, e.offsetY);
   if (e.button === 1 || (e.button === 0 && spaceDown)) {
@@ -522,10 +566,10 @@ cv.addEventListener('pointerdown', e => {
   if (e.button !== 0 || S.previewOn) return;
   const tool = S.tool;
   if (tool === 'select') {
-    const b = boundsOf(selected());
-    if (b) {
+    const sel = selected(), b = boundsOf(sel);
+    if (b && !sel.some(o => o.locked)) { // locked selections have no handles
       const hi = handlePoints(b).findIndex(([hx, hy]) => Math.hypot(hx - e.offsetX, hy - e.offsetY) <= 7);
-      if (hi >= 0) { drag = { kind: hi === 8 ? 'rotate' : 'scale', h: hi, b0: b, start: [wx, wy], orig: origOf(selected()), moved: false }; return; }
+      if (hi >= 0) { drag = { kind: hi === 8 ? 'rotate' : 'scale', h: hi, b0: b, start: [wx, wy], orig: origOf(sel), moved: false }; return; }
     }
     const hit = hitTest(wx, wy);
     if (hit) {
@@ -533,7 +577,7 @@ cv.addEventListener('pointerdown', e => {
       if (e.shiftKey) { const on = S.sel.has(hit.id); for (const id of ids) on ? S.sel.delete(id) : S.sel.add(id); }
       else if (!S.sel.has(hit.id)) S.sel = ids;
       selectionChanged();
-      drag = { kind: 'move', start: [wx, wy], orig: origOf(selected()), moved: false };
+      drag = { kind: 'move', start: [wx, wy], orig: origOf(selected()), moved: false, locked: selected().some(o => o.locked) };
       return;
     }
     if (!e.shiftKey) { S.sel.clear(); selectionChanged(); }
@@ -542,7 +586,12 @@ cv.addEventListener('pointerdown', e => {
   }
   if (tool === 'node') {
     const nh = nodeHit(e.offsetX, e.offsetY);
-    if (nh) { S.node = nh; drag = { kind: 'node', ...nh, moved: false }; requestDraw(); return; }
+    if (nh) {
+      S.node = nh; requestDraw();
+      const o = S.objects.find(x => x.id === nh.id);
+      if (o?.locked) blockLocked([o], 'edited'); else drag = { kind: 'node', ...nh, moved: false };
+      return;
+    }
     const hit = hitTest(wx, wy);
     S.node = null;
     S.sel = hit ? new Set([hit.id]) : new Set();
@@ -588,9 +637,10 @@ cv.addEventListener('pointermove', e => {
   }
   if (!drag) {
     if (S.tool === 'select' && !S.previewOn) {
-      const b = boundsOf(selected());
-      const onHandle = b && handlePoints(b).some(([hx, hy]) => Math.hypot(hx - e.offsetX, hy - e.offsetY) <= 7);
-      cv.style.cursor = spaceDown ? 'grab' : onHandle ? 'crosshair' : hitTest(wx, wy) ? 'move' : 'default';
+      const sel = selected(), b = boundsOf(sel);
+      const onHandle = b && !sel.some(o => o.locked) && handlePoints(b).some(([hx, hy]) => Math.hypot(hx - e.offsetX, hy - e.offsetY) <= 7);
+      const h = onHandle ? null : hitTest(wx, wy);
+      cv.style.cursor = spaceDown ? 'grab' : onHandle ? 'crosshair' : h ? (h.locked ? 'default' : 'move') : 'default';
     } else if (S.tool === 'node') cv.style.cursor = nodeHit(e.offsetX, e.offsetY) ? 'move' : 'default';
     else cv.style.cursor = spaceDown ? 'grab' : 'crosshair';
     return;
@@ -603,6 +653,7 @@ cv.addEventListener('pointermove', e => {
       if (e.shiftKey) { if (Math.abs(dx) > Math.abs(dy)) dy = 0; else dx = 0; }
       if (settings.snap > 0) { dx = snapV(dx); dy = snapV(dy); }
       if (!drag.moved && Math.hypot(dx, dy) * S.view.s < 2) return;
+      if (drag.locked) { if (!drag.told) { drag.told = true; blockLocked(selected(), 'moved'); } return; }
       if (!drag.moved) { pushUndo(); drag.moved = true; }
       for (const { o, tf } of drag.orig) o.tf = { ...tf, x: tf.x + dx, y: tf.y + dy };
       changed(); break;
@@ -663,7 +714,7 @@ cv.addEventListener('pointerup', () => {
     const mb = { minX: Math.min(x0, x1), maxX: Math.max(x0, x1), minY: Math.min(y0, y1), maxY: Math.max(y0, y1) };
     const crossing = x1 < x0;
     if ((mb.maxX - mb.minX) * S.view.s > 3) {
-      for (const o of S.objects) {
+      for (const o of visibleObjects()) {
         const b = objBounds(o);
         const inside = b.minX >= mb.minX && b.maxX <= mb.maxX && b.minY >= mb.minY && b.maxY <= mb.maxY;
         const touch = !(b.maxX < mb.minX || b.minX > mb.maxX || b.maxY < mb.minY || b.minY > mb.maxY);
@@ -690,8 +741,14 @@ cv.addEventListener('pointerup', () => {
 cv.addEventListener('dblclick', e => {
   if (S.tool === 'line' && S.draft) { finishLine(false); return; }
   if (S.tool !== 'node') return;
-  // insert a node on the nearest segment
-  const [wx, wy] = toWorld(e.offsetX, e.offsetY), tol = 6 / S.view.s;
+  const [wx, wy] = toWorld(e.offsetX, e.offsetY), h = segmentHit(wx, wy);
+  if (h) insertNode(h.o, h.pi, h.i, [wx, wy]); // insert a node on the nearest segment
+});
+
+// ---- node editing (polylines: sub-path pi, vertex vi; segment i runs from vertex i-1 to vertex i)
+// The line of a selected shape under world point (wx, wy), or null.
+function segmentHit(wx, wy) {
+  const tol = 6 / S.view.s;
   for (const o of selected()) {
     if (o.type === 'image') continue;
     const polys = worldPolys(o);
@@ -699,19 +756,41 @@ cv.addEventListener('dblclick', e => {
       const pts = polys[pi].pts, n = pts.length;
       for (let i = 1; i < n + (polys[pi].closed ? 1 : 0); i++) {
         const a = pts[i - 1], b = pts[i % n];
-        if (G.distToSegment(wx, wy, a[0], a[1], b[0], b[1]) <= tol) {
-          edit(() => {
-            ensurePath(o);
-            const local = G.apply(G.invert(G.tfMatrix(o.tf)), wx, wy);
-            o.polys = o.polys.map((p, k) => k !== pi ? p : { closed: p.closed, pts: [...p.pts.slice(0, i), local, ...p.pts.slice(i)] });
-            S.node = { id: o.id, pi, vi: i };
-          });
-          return;
-        }
+        if (G.distToSegment(wx, wy, a[0], a[1], b[0], b[1]) <= tol) return { o, pi, i };
       }
     }
   }
-});
+  return null;
+}
+// Geometry edit of one object in its own (local) coordinates; shapes and text become paths.
+function nodeEdit(o, fn) {
+  if (blockLocked([o], 'edited')) return false;
+  edit(() => { ensurePath(o); fn(o); });
+  return true;
+}
+const toLocal = (o, [x, y]) => G.apply(G.invert(G.tfMatrix(o.tf)), x, y);
+function insertNode(o, pi, i, world) {
+  const local = toLocal(o, world);
+  nodeEdit(o, () => {
+    o.polys = o.polys.map((p, k) => k !== pi ? p : { closed: p.closed, pts: [...p.pts.slice(0, i), local, ...p.pts.slice(i)] });
+    S.node = { id: o.id, pi, vi: i };
+  });
+}
+function breakNode(o, pi, vi) {
+  if (o.type === 'path' && !breakAt(o.polys, pi, vi)) return msg('That point is already an end of the path');
+  nodeEdit(o, () => { o.polys = breakAt(o.polys, pi, vi) || o.polys; S.node = null; });
+}
+function deleteSegment(o, pi, i) { // i: segment index as returned by segmentHit
+  nodeEdit(o, () => {
+    const r = removeSegment(o.polys, pi, i - 1);
+    if (r) o.polys = r;
+    if (!o.polys.length) S.objects = S.objects.filter(x => x !== o);
+    S.node = null;
+  });
+}
+function closeSubpath(o, pi) {
+  nodeEdit(o, () => { o.polys = o.polys.map((p, k) => k === pi && p.pts.length >= 3 ? { closed: true, pts: p.pts } : p); });
+}
 cv.addEventListener('wheel', e => {
   e.preventDefault();
   if (e.ctrlKey || !e.shiftKey) zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * (e.deltaMode ? 0.05 : 0.0015)));
@@ -728,6 +807,7 @@ function finishLine(close) {
 function deleteNode() {
   const n = S.node, o = n && S.objects.find(x => x.id === n.id);
   if (!o) return false;
+  if (blockLocked([o], 'edited')) return true;
   edit(() => {
     ensurePath(o);
     const p = o.polys[n.pi], min = p.closed ? 3 : 2;
@@ -758,20 +838,43 @@ function setTool(t) {
 $$('.tools [data-tool]').forEach(b => b.addEventListener('click', () => setTool(b.dataset.tool)));
 
 const typing = () => /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName) || $('#dlg').open;
+// Shortcuts follow LightBurn where they don't clash with BeamForge's single-letter tool keys.
+const KEYS_MOD = { z: 'undo', y: 'redo', s: 'save', o: 'open', i: 'import', e: 'export', d: 'dup', a: 'select-all', c: 'copy', x: 'cut',
+  v: 'paste', g: 'group', u: 'ungroup', pageup: 'order-front', pagedown: 'order-back' };
+const KEYS_MOD_SHIFT = { z: 'redo', g: 'ungroup', i: 'invert-sel', c: 'topath', b: 'to-bitmap', h: 'mirror-h', v: 'mirror-v', m: 'mirror-line',
+  a: 'zoom-sel', arrowleft: 'al-l', arrowright: 'al-r', arrowup: 'al-t', arrowdown: 'al-b' };
+const KEYS_ALT = { p: 'preview', v: 'paste-place', c: 'close-paths', j: 'join', d: 'dedupe', b: 'break', o: 'offset', t: 'trace', i: 'img-adjust' };
+const KEYS_ALT_SHIFT = { o: 'optimize', h: 'together-h', v: 'together-v' };
+function removeLastPoint() {
+  const d = S.draft; if (!d || d.kind !== 'line') return;
+  d.pts.pop(); if (!d.pts.length) S.draft = null;
+  requestDraw();
+}
+function zoomBy(k) { const r = stage.getBoundingClientRect(); zoomAt(r.width / 2, r.height / 2, k); }
 window.addEventListener('keydown', e => {
   if (typing()) return;
   const mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
+  const letter = /^Key[A-Z]$/.test(e.code || '') ? e.code.slice(3).toLowerCase() : k; // keyboard-layout proof for Alt+letter
+  if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) { e.preventDefault(); openCanvasMenuAtSelection(); return; }
   if (e.key === ' ') { spaceDown = true; cv.style.cursor = 'grab'; e.preventDefault(); return; }
-  const combos = {
-    z: e.shiftKey ? 'redo' : 'undo', y: 'redo', s: 'save', o: 'open', i: 'import', e: 'export', d: 'dup',
-    a: 'select-all', c: 'copy', x: 'cut', v: 'paste', g: e.shiftKey ? 'ungroup' : 'group',
-  };
-  if (mod && combos[k]) { e.preventDefault(); act(combos[k]); return; }
-  if (e.altKey && k === 'p') { e.preventDefault(); act('preview'); return; }
-  if (mod) return;
-  if (e.key === 'Delete' || e.key === 'Backspace') { if (S.tool === 'node' && deleteNode()) return; act('del'); return; }
+  if (mod) {
+    const name = !e.altKey && ((e.shiftKey && KEYS_MOD_SHIFT[k]) || KEYS_MOD[k]);
+    if (name) { e.preventDefault(); act(name); }
+    return;
+  }
+  if (e.altKey) {
+    const name = (e.shiftKey ? KEYS_ALT_SHIFT : KEYS_ALT)[letter];
+    if (name) { e.preventDefault(); act(name); return; }
+    if (!e.key.startsWith('Arrow')) return; // Alt+arrow nudges by 0.1 mm (below)
+  }
+  if (e.key === 'PageUp' || e.key === 'PageDown') { e.preventDefault(); act(e.key === 'PageUp' ? 'order-fwd' : 'order-bwd'); return; }
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (e.key === 'Backspace' && S.draft?.kind === 'line') { removeLastPoint(); return; }
+    if (S.tool === 'node' && deleteNode()) return;
+    act('del'); return;
+  }
   if (e.key === 'Escape') {
-    closeMenus();
+    closeMenu();
     if (S.draft) { S.draft = null; requestDraw(); } else if (S.previewOn) act('preview');
     else if (S.tool !== 'select') setTool('select'); else { S.sel.clear(); selectionChanged(); }
     return;
@@ -779,30 +882,25 @@ window.addEventListener('keydown', e => {
   if (e.key === 'Enter' && S.draft && S.draft.kind === 'line') { finishLine(false); return; }
   if (e.key.startsWith('Arrow') && S.sel.size) {
     e.preventDefault();
+    if (blockLocked(selected(), 'moved')) return;
     const st = e.shiftKey ? 10 : e.altKey ? 0.1 : 1;
     const dx = e.key === 'ArrowLeft' ? -st : e.key === 'ArrowRight' ? st : 0;
     const dy = e.key === 'ArrowUp' ? -st : e.key === 'ArrowDown' ? st : 0;
     edit(() => selected().forEach(o => { o.tf = { ...o.tf, x: o.tf.x + dx, y: o.tf.y + dy }; }));
     return;
   }
+  if (S.tool === 'node' && !e.shiftKey) { // node-editing keys, as in LightBurn
+    if (k === 'd' && S.node) { deleteNode(); return; }
+    if (k === 'b' && S.node) { const o = S.objects.find(x => x.id === S.node.id); if (o) breakNode(o, S.node.pi, S.node.vi); return; }
+    if (k === 'i' && S.cursor) { const h = segmentHit(...S.cursor); if (h) insertNode(h.o, h.pi, h.i, S.cursor); return; }
+  }
   const tools = { v: 'select', n: 'node', r: 'rect', e: 'ellipse', p: 'polygon', l: 'line', t: 'text', m: 'measure' };
   if (tools[k]) { setTool(tools[k]); return; }
   if (k === 'f') zoomFit();
+  else if (k === '+' || k === '=') zoomBy(1.25);
+  else if (k === '-' || k === '_') zoomBy(0.8);
 });
 window.addEventListener('keyup', e => { if (e.key === ' ') { spaceDown = false; cv.style.cursor = 'default'; } });
-
-// ================================================================ menus
-function closeMenus() { $$('.menu.open').forEach(m => m.classList.remove('open')); }
-function openMenu(m) {
-  closeMenus(); m.classList.add('open');
-  const r = m.querySelector('.menu-btn').getBoundingClientRect(), pop = m.querySelector('.menu-pop');
-  pop.style.left = `${Math.min(r.left, innerWidth - 260)}px`; pop.style.top = `${r.bottom + 4}px`;
-}
-$$('.menu').forEach(m => {
-  m.querySelector('.menu-btn').addEventListener('click', ev => { ev.stopPropagation(); m.classList.contains('open') ? closeMenus() : openMenu(m); });
-  m.querySelector('.menu-btn').addEventListener('mouseenter', () => { if ($('.menu.open') && !m.classList.contains('open')) openMenu(m); });
-});
-document.addEventListener('click', ev => { if (!ev.target.closest('.menu-pop')) closeMenus(); });
 
 // ================================================================ dialogs
 const FONTS = ['sans-serif', 'serif', 'monospace', '"DejaVu Sans"', '"DejaVu Serif"', '"Liberation Sans"', '"Liberation Serif"', '"Noto Sans"', '"Noto Serif"', 'Arial', 'Georgia', '"Times New Roman"', 'Verdana', 'Impact', 'cursive', 'fantasy'];
@@ -1038,21 +1136,69 @@ $('#file-lib').addEventListener('change', async e => {
 });
 
 // ================================================================ trace (live preview)
+// Full-detail traces run in a worker so the dialog stays responsive. run() resolves with loops in raster pixels;
+// a newer run() cancels the one in progress (by restarting the worker).
+function traceRunner() {
+  let w = null, sent = null, job = null, seq = 0, failed = typeof Worker === 'undefined';
+  const cancel = why => { const j = job; job = null; j?.reject(Object.assign(new Error(why), { cancelled: true })); };
+  const fail = e => { failed = true; console.warn('Trace worker unavailable, tracing on the main thread:', e); w?.terminate(); w = null; cancel('worker failed'); };
+  const send = j => { w.postMessage({ id: j.id, key: j.key, W: j.W, H: j.H, opts: j.opts, v: sent === j.key ? null : j.v }); sent = j.key; };
+  const spawn = () => {
+    try { w = new Worker(new URL('./trace-worker.js', import.meta.url), { type: 'module' }); } catch (e) { fail(e); return false; }
+    sent = null;
+    w.onerror = e => { e.preventDefault(); fail(e.message || 'could not start'); };
+    w.onmessage = ({ data: m }) => {
+      if (!job || m.id !== job.id) return;
+      if (m.missing) { sent = null; send(job); return; }
+      const j = job; job = null;
+      if (m.error) j.reject(new Error(m.error)); else j.resolve(unpackLoops(m.xy, m.starts));
+    };
+    return true;
+  };
+  return {
+    get ok() { return !failed; },
+    run(key, v, W, H, opts) {
+      if (job) { cancel('superseded'); w?.terminate(); w = null; }
+      if (failed || (!w && !spawn())) return Promise.reject(Object.assign(new Error('no worker'), { cancelled: true }));
+      return new Promise((resolve, reject) => { job = { id: ++seq, key, v, W, H, opts, resolve, reject }; send(job); });
+    },
+    stop() { cancel('stopped'); w?.terminate(); w = null; },
+  };
+}
+function unpackLoops(xy, starts) {
+  const loops = [];
+  for (let i = 0; i + 1 < starts.length; i++) {
+    const l = new Array(starts[i + 1] - starts[i]);
+    for (let j = starts[i], k = 0; j < starts[i + 1]; j++, k++) l[k] = [xy[2 * j], xy[2 * j + 1]];
+    loops.push(l);
+  }
+  return loops;
+}
+
+const TRACE_QUICK_PX = 700; // longest side of the instant (reduced-detail) preview
 function traceDialog() {
   const o = selected().find(x => x.type === 'image');
   if (!o) return msg('Select an image to trace');
   const prefs = { mode: 'brightness', cutoff: 0, threshold: 128, edge: 60, ignore: 6, optimize: 0.6, smooth: 0.4, res: 10, fade: true, del: false, ...(settings.trace || {}) };
-  const dlg = $('#dlg'), form = $('#dlg-form');
-  const cvs = el('canvas', { width: 480, height: 320, style: 'width:100%;background:#fff;border-radius:6px;border:1px solid var(--line)' });
-  const info = el('div', { class: 'muted small' });
+  const dlg = $('#dlg'), form = $('#dlg-form'), runner = traceRunner();
+  const cvs = el('canvas', { class: 'trace-cv', tabindex: 0, 'aria-label': 'Trace preview',
+    title: 'Scroll to zoom, drag to move around, double-click to zoom in or back out. Keys: + − 0 and arrows.' });
+  const info = el('span', { class: 'info muted small' }, 'Tracing…');
+  const note = el('p', { class: 'small auto-note', hidden: true });
+  const zoomLbl = el('span', { class: 'zl muted small', title: 'Zoom (1× shows the whole picture)' }, '1×');
+
+  // ---- settings
+  const set = {}; // key → update the control after Auto trace
   const slider = (key, label, min, max, step) => {
     const val = el('span', { class: 'muted small', style: 'min-width:34px;text-align:right' }, String(prefs[key]));
     const i = el('input', { type: 'range', min, max, step, value: prefs[key] });
-    i.addEventListener('input', () => { prefs[key] = +i.value; val.textContent = i.value; schedule(); });
+    i.addEventListener('input', () => { prefs[key] = +i.value; val.textContent = i.value; changed(); });
+    set[key] = v => { i.value = v; prefs[key] = +i.value; val.textContent = i.value; };
     return el('label', { class: 'fld', 'data-for': key }, el('span', {}, label), el('div', { class: 'row' }, i, val));
   };
-  const modeSel = selInput(prefs.mode, [['brightness', 'Brightness (cutoff → threshold)'], ['sketch', 'Sketch — trace edges'], ['transparency', 'Transparency (PNG alpha)']], v => { prefs.mode = v; sync(); schedule(); });
-  const fade = chkInput(prefs.fade, v => { prefs.fade = v; draw(); });
+  const modeSel = selInput(prefs.mode, [['brightness', 'Brightness'], ['sketch', 'Sketch — trace edges'], ['transparency', 'Transparency (PNG alpha)']], v => { prefs.mode = v; sync(); changed(); });
+  set.mode = v => { modeSel.value = v; prefs.mode = modeSel.value; };
+  const fade = chkInput(prefs.fade, v => { prefs.fade = v; requestDraw(); });
   const del = chkInput(prefs.del, v => { prefs.del = v; });
   const rows = {
     cutoff: slider('cutoff', 'Cutoff', 0, 255, 1), threshold: slider('threshold', 'Threshold', 0, 255, 1),
@@ -1062,60 +1208,246 @@ function traceDialog() {
     rows.cutoff.style.display = rows.threshold.style.display = prefs.mode === 'brightness' ? '' : 'none';
     rows.edge.style.display = prefs.mode === 'sketch' ? '' : 'none';
   };
-  let result = null, timer = null;
-  const draw = () => {
-    const g = cvs.getContext('2d'), Wc = cvs.width, Hc = cvs.height;
-    g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, Wc, Hc);
-    const k = Math.min(Wc / o.w, Hc / o.h) * 0.96, ox = Wc / 2, oy = Hc / 2;
+
+  // ---- tracing: an instant reduced-detail preview here, then the exact full-detail result from the worker
+  const key = () => [prefs.mode, prefs.cutoff, prefs.threshold, prefs.edge, prefs.ignore, prefs.optimize, prefs.smooth, prefs.res].join('|');
+  let quick = null, full = null, fullErr = false, timer = 0, fullTimer = 0, raf = 0;
+  const rasters = new Map(); // pixel values per channel and size
+  const raster = (mode, W, H) => {
+    const k = `${mode === 'transparency' ? 'a' : 'g'}|${W}x${H}`;
+    let v = rasters.get(k);
+    if (!v) {
+      v = traceRaster(o, mode, W, H);
+      if (rasters.size >= 4) rasters.delete(rasters.keys().next().value);
+      rasters.set(k, v);
+    }
+    return { k, v };
+  };
+  const result = (k, loops, W, H) => {
+    const box = new Float32Array(loops.length * 4);
+    let pts = 0;
+    loops.forEach((l, i) => {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const [x, y] of l) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+      box[i * 4] = x0; box[i * 4 + 1] = y0; box[i * 4 + 2] = x1; box[i * 4 + 3] = y1;
+      pts += l.length;
+    });
+    return { key: k, loops, W, H, box, pts };
+  };
+  const exact = () => full && full.key === key();
+  const shown = () => (exact() ? full : quick);
+  const status = () => {
+    const r = shown();
+    if (!r) return;
+    const n = r.loops.length;
+    info.textContent = `${n.toLocaleString()} shape${n === 1 ? '' : 's'} · ${r.pts.toLocaleString()} points`
+      + (exact() ? '' : runner.ok && !fullErr ? ' · refining…' : ' · reduced-detail preview');
+  };
+  const syncFull = () => {
+    const k = key(), [W, H] = traceSize(o, prefs.res);
+    try { full = result(k, traceValues(raster(prefs.mode, W, H).v, W, H, { ...prefs, unit: 1 }), W, H); } catch (e) { info.textContent = e.message; return; }
+    status(); requestDraw();
+  };
+  // Without a worker the full trace blocks, so it only runs once you zoom in.
+  const requestFull = (ms = 150) => {
+    clearTimeout(fullTimer);
+    fullTimer = setTimeout(() => {
+      if (exact()) return;
+      const k = key(), [W, H] = traceSize(o, prefs.res);
+      if (!runner.ok) { if (view.z > 1.5) syncFull(); return; }
+      let rv;
+      try { rv = raster(prefs.mode, W, H); } catch (e) { info.textContent = e.message; return; }
+      runner.run(rv.k, rv.v, W, H, { ...prefs, unit: 1 }).then(loops => {
+        if (k !== key()) return; // the settings have moved on
+        full = result(k, loops, W, H); status(); requestDraw();
+      }, e => {
+        if (!e.cancelled) { fullErr = true; status(); console.warn(e); }
+        if (!runner.ok && view.z > 1.5 && k === key()) syncFull();
+      });
+    }, ms);
+  };
+  const runQuick = () => {
+    const k = key(), [W0, H0] = traceSize(o, prefs.res), [W, H] = traceSize(o, prefs.res, TRACE_QUICK_PX);
+    fullErr = false;
+    quick = result(k, traceValues(raster(prefs.mode, W, H).v, W, H, { ...prefs, unit: W0 / W }), W, H);
+    if (W === W0 && H === H0) full = quick; // small image: the preview is already full detail
+    else requestFull();
+    status(); requestDraw();
+  };
+  const schedule = (ms = 120) => { clearTimeout(timer); timer = setTimeout(() => { try { runQuick(); } catch (e) { info.textContent = e.message; } }, ms); };
+  const changed = () => { note.hidden = true; schedule(); };
+
+  // ---- preview: zoom and pan
+  const view = { z: 1, cx: 0, cy: 0 }; // zoom (1 = whole image) and the mm point (from the image centre) in the middle
+  let moved = false; // hide the how-to-zoom hint once the view has been zoomed or moved
+  const dpr = () => window.devicePixelRatio || 1;
+  let pic = null;
+  const picture = () => { // the picture with its adjustments, drawn once
+    if (pic) return pic;
     const img = imageSource(o);
-    if (img) {
-      g.save(); g.globalAlpha = prefs.fade ? 0.3 : 1; g.filter = imageFilter(o);
-      g.drawImage(img, ox - o.w / 2 * k, oy - o.h / 2 * k, o.w * k, o.h * k); g.restore();
-    }
-    if (!result) return;
-    g.strokeStyle = '#e5484d'; g.lineWidth = 1.2; g.beginPath();
-    for (const p of result.polys) { p.pts.forEach(([x, y], i) => i ? g.lineTo(ox + x * k, oy + y * k) : g.moveTo(ox + x * k, oy + y * k)); g.closePath(); }
-    g.stroke();
+    if (!img) return null;
+    const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height, s = Math.min(1, 4096 / Math.max(iw, ih));
+    const c = makeCanvas(Math.max(1, Math.round(iw * s)), Math.max(1, Math.round(ih * s))), g = c.getContext('2d');
+    g.filter = imageFilter(o); g.drawImage(img, 0, 0, c.width, c.height);
+    return (pic = c);
   };
-  const run = full => {
-    const opts = { ...prefs, maxPx: full ? 3000 : 700 };
-    const r = traceImage(o, opts);
-    if (!full) {
-      result = r; draw();
-      info.textContent = `${r.polys.length} shape(s), ${r.polys.reduce((a, p) => a + p.pts.length, 0).toLocaleString()} points (preview at reduced detail)`;
-    }
-    return r;
+  const fitK = () => Math.min(cvs.width / o.w, cvs.height / o.h) * 0.96; // device px per mm at "Fit"
+  const maxZoom = () => clamp(40 * (traceSize(o, prefs.res)[0] / o.w) / fitK(), 4, 400); // ~40 px per trace pixel
+  const clampView = () => { // keep the middle of the view on the picture; at 1× show it all, centred
+    view.z = clamp(view.z, 1, maxZoom());
+    if (view.z < 1.0001) view.cx = view.cy = 0;
+    else { view.cx = clamp(view.cx, -o.w / 2, o.w / 2); view.cy = clamp(view.cy, -o.h / 2, o.h / 2); }
+    zoomLbl.textContent = `${view.z < 10 ? Math.round(view.z * 10) / 10 : Math.round(view.z)}×`;
   };
-  const schedule = () => { clearTimeout(timer); timer = setTimeout(() => { try { run(false); } catch (e) { info.textContent = e.message; } }, 120); };
-  form.replaceChildren(el('h2', {}, 'Trace image'), cvs, info,
-    el('div', { class: 'scroll' },
-      field('Mode', modeSel), rows.cutoff, rows.threshold, rows.edge,
-      slider('ignore', 'Ignore less than (px²)', 0, 400, 1), slider('smooth', 'Smoothness', 0, 1, 0.05),
-      slider('optimize', 'Optimize (px)', 0.05, 3, 0.05), slider('res', 'Detail (px/mm)', 2, 30, 1),
-      check('Fade image in preview', fade), check('Delete the image after tracing', del)),
+  const draw = () => {
+    raf = 0;
+    const g = cvs.getContext('2d'), Wc = cvs.width, Hc = cvs.height;
+    g.setTransform(1, 0, 0, 1, 0, 0); g.fillStyle = '#fff'; g.fillRect(0, 0, Wc, Hc);
+    if (Wc < 2 || Hc < 2) return;
+    const k = fitK() * view.z, x0 = Wc / 2 - (view.cx + o.w / 2) * k, y0 = Hc / 2 - (view.cy + o.h / 2) * k;
+    const p = picture();
+    if (p) {
+      g.save(); g.globalAlpha = prefs.fade ? 0.3 : 1;
+      g.imageSmoothingEnabled = o.w * k / p.width < 3; // big zoom: show the real pixels
+      g.drawImage(p, x0, y0, o.w * k, o.h * k); g.restore();
+    }
+    g.strokeStyle = 'rgba(0,0,0,.2)'; g.lineWidth = 1;
+    g.strokeRect(Math.round(x0) - 0.5, Math.round(y0) - 0.5, Math.round(o.w * k) + 1, Math.round(o.h * k) + 1);
+    const r = shown();
+    if (r) {
+      const sx = o.w * k / r.W, sy = o.h * k / r.H;
+      const vx0 = -x0 / sx, vy0 = -y0 / sy, vx1 = (Wc - x0) / sx, vy1 = (Hc - y0) / sy; // the visible part, in trace pixels
+      g.strokeStyle = '#e5484d'; g.lineWidth = 1.25 * dpr(); g.lineJoin = 'round'; g.beginPath();
+      r.loops.forEach((l, i) => {
+        const b = i * 4;
+        if (r.box[b + 2] < vx0 || r.box[b] > vx1 || r.box[b + 3] < vy0 || r.box[b + 1] > vy1) return;
+        for (let j = 0; j < l.length; j++) { const X = x0 + l[j][0] * sx, Y = y0 + l[j][1] * sy; if (j) g.lineTo(X, Y); else g.moveTo(X, Y); }
+        g.closePath();
+      });
+      g.stroke();
+    }
+    if (!moved) { // until the first zoom or move: say how
+      const d = dpr(), text = 'Scroll to zoom  ·  drag to move  ·  double-click to zoom in';
+      g.font = `${12 * d}px system-ui, sans-serif`;
+      const w = g.measureText(text).width + 18 * d, h = 26 * d, x = 10 * d, y = Hc - h - 10 * d;
+      g.fillStyle = 'rgba(22,24,28,.75)'; g.beginPath();
+      if (g.roundRect) g.roundRect(x, y, w, h, 6 * d); else g.rect(x, y, w, h);
+      g.fill(); g.fillStyle = '#fff'; g.textBaseline = 'middle'; g.fillText(text, x + 9 * d, y + h / 2);
+    }
+  };
+  const requestDraw = () => { if (!raf) raf = requestAnimationFrame(draw); };
+  const zoomAt = (px, py, f) => { // px, py: device pixels on the canvas; keeps that point still
+    const k0 = fitK() * view.z, wx = view.cx + (px - cvs.width / 2) / k0, wy = view.cy + (py - cvs.height / 2) / k0;
+    view.z = clamp(view.z * f, 1, maxZoom());
+    moved = true;
+    const k1 = fitK() * view.z;
+    view.cx = wx - (px - cvs.width / 2) / k1; view.cy = wy - (py - cvs.height / 2) / k1;
+    clampView(); requestDraw();
+    if (view.z > 1.5 && !exact() && !runner.ok) requestFull(300);
+  };
+  const zoomStep = f => zoomAt(cvs.width / 2, cvs.height / 2, f);
+  const fit = () => { view.z = 1; view.cx = view.cy = 0; clampView(); requestDraw(); };
+  const pan = (dx, dy) => { const k = fitK() * view.z; view.cx += dx * cvs.width / 6 / k; view.cy += dy * cvs.height / 6 / k; moved = true; clampView(); requestDraw(); };
+  const devXY = e => { const r = cvs.getBoundingClientRect(), d = dpr(); return [(e.clientX - r.left) * d, (e.clientY - r.top) * d]; };
+  let drag = null;
+  cvs.addEventListener('wheel', e => { e.preventDefault(); const [x, y] = devXY(e); zoomAt(x, y, Math.exp(-e.deltaY * (e.deltaMode ? 0.05 : 0.0015))); }, { passive: false });
+  cvs.addEventListener('pointerdown', e => {
+    if (e.button !== 0 && e.button !== 1) return;
+    if (e.button === 1) e.preventDefault();
+    cvs.setPointerCapture(e.pointerId);
+    drag = { id: e.pointerId, x: e.clientX, y: e.clientY, cx: view.cx, cy: view.cy };
+    cvs.classList.add('panning');
+  });
+  cvs.addEventListener('pointermove', e => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const k = fitK() * view.z / dpr();
+    view.cx = drag.cx - (e.clientX - drag.x) / k; view.cy = drag.cy - (e.clientY - drag.y) / k;
+    if (view.z > 1.0001) moved = true;
+    clampView(); requestDraw();
+  });
+  const endDrag = e => { if (drag && drag.id === e.pointerId) { drag = null; cvs.classList.remove('panning'); } };
+  cvs.addEventListener('pointerup', endDrag);
+  cvs.addEventListener('pointercancel', endDrag);
+  cvs.addEventListener('dblclick', e => { if (view.z > 1.01) fit(); else { const [x, y] = devXY(e); zoomAt(x, y, 4); } });
+  cvs.addEventListener('keydown', e => {
+    const f = { '+': () => zoomStep(1.5), '=': () => zoomStep(1.5), '-': () => zoomStep(1 / 1.5), '_': () => zoomStep(1 / 1.5), 0: fit,
+      ArrowLeft: () => pan(-1, 0), ArrowRight: () => pan(1, 0), ArrowUp: () => pan(0, -1), ArrowDown: () => pan(0, 1) }[e.key];
+    if (f && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); f(); }
+  });
+  const ro = new ResizeObserver(() => {
+    const d = dpr(), W = Math.max(1, Math.round(cvs.clientWidth * d)), H = Math.max(1, Math.round(cvs.clientHeight * d));
+    if (cvs.width !== W || cvs.height !== H) { cvs.width = W; cvs.height = H; clampView(); draw(); }
+  });
+
+  // ---- Auto trace: look at the picture and choose the settings
+  const AUTO_KEYS = ['mode', 'cutoff', 'threshold', 'edge', 'ignore', 'optimize', 'smooth', 'res'];
+  const describe = a => {
+    const what = a.mode === 'transparency' ? 'the outline of the non-transparent parts'
+      : a.mode === 'sketch' ? `edges, sensitivity ${a.edge}`
+        : a.lightBg ? `dark shapes on a light background (threshold ${a.threshold})` : `light shapes on a dark background (cutoff ${a.cutoff})`;
+    return `Auto trace: ${what}${a.noisy ? `; specks under ${a.ignore} px² left out` : ''}.`
+      + (a.photo && a.mode === 'brightness' ? ' This looks like a photo, so the result is a two-tone stencil; Sketch mode traces outlines instead.' : '')
+      + ' Adjust anything, then press Trace.';
+  };
+  const autoBtn = el('button', { type: 'button', class: 'auto-btn', title: 'Look at the picture and choose the mode, threshold and clean-up settings for it' }, 'Auto trace');
+  autoBtn.addEventListener('click', () => {
+    autoBtn.disabled = true; info.textContent = 'Looking at the picture…';
+    requestAnimationFrame(() => setTimeout(() => { // let the message show first
+      autoBtn.disabled = false;
+      let a;
+      try { a = autoTrace(o, prefs, (mode, W, H) => raster(mode, W, H).v); } catch (e) { info.textContent = e.message; return; }
+      note.hidden = false; note.classList.toggle('warn', !!a.none);
+      if (a.none) {
+        note.textContent = a.none === 'flat' ? 'Auto trace: this picture is all one shade, so there is nothing to trace.'
+          : 'Auto trace: the picture is too faint to separate shapes from the background. Raise its contrast with Adjust image (Alt+I) first.';
+        status(); return;
+      }
+      for (const k of AUTO_KEYS) if (a[k] != null) set[k](a[k]);
+      note.textContent = describe({ ...a, ...prefs, lightBg: a.lightBg });
+      sync(); schedule(0);
+    }, 0));
+  });
+
+  form.replaceChildren(el('h2', {}, 'Trace image'),
+    el('div', { class: 'trace-body' },
+      el('div', { class: 'trace-view' }, cvs,
+        el('div', { class: 'trace-bar' }, info,
+          el('button', { type: 'button', title: 'Zoom out (−)', 'aria-label': 'Zoom out', onclick: () => zoomStep(1 / 1.5) }, '−'),
+          zoomLbl,
+          el('button', { type: 'button', title: 'Zoom in (+)', 'aria-label': 'Zoom in', onclick: () => zoomStep(1.5) }, '+'),
+          el('button', { type: 'button', title: 'Show the whole picture (0)', onclick: fit }, 'Fit'))),
+      el('div', { class: 'trace-side' }, autoBtn, note,
+        el('div', { class: 'scroll' },
+          field('Mode', modeSel), rows.cutoff, rows.threshold, rows.edge,
+          slider('ignore', 'Ignore less than (px²)', 0, 400, 1), slider('smooth', 'Smoothness', 0, 1, 0.05),
+          slider('optimize', 'Optimize (px)', 0.05, 3, 0.05), slider('res', 'Detail (px/mm)', 2, 30, 1),
+          check('Fade image in preview', fade), check('Delete the image after tracing', del)))),
     el('div', { class: 'actions' },
       el('button', { value: 'cancel', type: 'submit', formnovalidate: true }, 'Cancel'),
       el('button', { value: 'ok', type: 'submit', class: 'primary' }, 'Trace')));
   sync();
   dlg.onclose = () => {
-    clearTimeout(timer);
+    clearTimeout(timer); clearTimeout(fullTimer); cancelAnimationFrame(raf); ro.disconnect(); runner.stop();
+    dlg.classList.remove('trace-dlg');
     settings.trace = { ...prefs }; saveSettings();
     if (dlg.returnValue !== 'ok') return;
     try {
-      const { polys } = run(true);
+      const polys = exact() ? loopsToLocal(full.loops, o, full.W, full.H) : traceImage(o, prefs).polys;
       if (!polys.length) return msg('Nothing found with those settings', 'err');
       edit(() => {
         const L = activeLayer().mode === 'image' ? (S.layers.find(l => l.mode !== 'image') || layerForColor(PALETTE[1])) : activeLayer();
         const p = addObject({ type: 'path', name: 'Traced ' + (o.name || 'image'), polys, layer: L.id, tf: { ...o.tf } });
-        if (prefs.del) S.objects = S.objects.filter(x => x !== o);
+        if (prefs.del && !o.locked) S.objects = S.objects.filter(x => x !== o); // a locked image is kept
         S.sel = new Set([p.id]);
       });
       msg(`Traced ${polys.length} shape(s)`, 'ok');
     } catch (e) { msg(e.message, 'err'); }
   };
+  dlg.classList.add('trace-dlg');
   dlg.returnValue = '';
   dlg.showModal();
-  schedule();
+  ro.observe(cvs);
+  schedule(0);
 }
 
 // ================================================================ actions
@@ -1134,18 +1466,25 @@ function boolAction(op, label) {
   // Order follows the drawing order, so "first" is the bottom-most selected object.
   const objs = selected().filter(o => o.type !== 'image');
   if (objs.length < (op === 'union' ? 1 : 2)) return msg(`Select ${op === 'union' ? 'one or more' : 'two or more'} shapes`);
+  if (blockLocked(objs, 'changed')) return;
   try {
     const groups = objs.map(o => worldPolys(o));
     const polys = op === 'union' ? booleanOp('union', groups) : booleanOp(op, [groups[0]], groups.slice(1));
     replaceWithResult(objs, polys, label);
   } catch (e) { msg(e.message, 'err'); }
 }
+// Copies are never locked, and land on the active layer if their own layer has been deleted since copying.
 function copyObjs(list, dx, dy) {
   const regroup = new Map();
-  return list.map(c => {
+  return list.map(({ locked, ...c }) => {
     const g = c.group ? (regroup.get(c.group) || regroup.set(c.group, uid()).get(c.group)) : undefined;
-    return addObject({ ...c, id: undefined, group: g, tf: { ...c.tf, x: c.tf.x + dx, y: c.tf.y + dy } });
+    return addObject({ ...c, id: undefined, group: g, layer: layerById(c.layer) ? c.layer : activeLayer().id, tf: { ...c.tf, x: c.tf.x + dx, y: c.tf.y + dy } });
   });
+}
+function pasteAt([x, y]) {
+  const b = boundsOf(S.clipboard); if (!b) return;
+  const dx = x - (b.minX + b.maxX) / 2, dy = y - (b.minY + b.maxY) / 2;
+  edit(() => { S.sel = new Set(copyObjs(S.clipboard, dx, dy).map(o => o.id)); });
 }
 
 // ================================================================ generators & production tools
@@ -1238,6 +1577,7 @@ async function materialTestDialog() {
 async function packDialog() {
   const objs = S.sel.size ? selected() : S.objects;
   if (!objs.length) return msg('Nothing to pack');
+  if (blockLocked(objs, 'moved')) return;
   const P = settings.pack || { gap: 3, margin: 5, rotate: true };
   const v = await formDialog('Pack onto the bed', [
     { key: 'gap', label: 'Gap between parts (mm)', type: 'number', value: P.gap, min: 0 },
@@ -1294,6 +1634,7 @@ function printAndCutDialog() {
       kids.push(el('p', {}, `Measured: rotation ${ang.toFixed(2)}°, distance ${r3(db)} mm vs ${r3(da)} mm in the design (${((db / da - 1) * 100).toFixed(2)}%).`),
         el('button', {
           type: 'button', class: 'primary', onclick: () => {
+            if (blockLocked(S.objects, 'moved')) return;
             const k = allowScale && da > 0 ? db / da : 1;
             const ma = [(A[0][0] + A[1][0]) / 2, (A[0][1] + A[1][1]) / 2], mb = [(got[0][0] + got[1][0]) / 2, (got[0][1] + got[1][1]) / 2];
             edit(() => {
@@ -1378,22 +1719,38 @@ const ACTIONS = {
     $('#file-gcode').click();
   },
   undo, redo,
-  copy() { S.clipboard = selected().map(o => ({ ...o, tf: { ...o.tf } })); msg(`Copied ${S.clipboard.length} object(s)`); },
-  cut() { S.clipboard = selected().map(o => ({ ...o, tf: { ...o.tf } })); ACTIONS.del(); },
-  paste() {
-    if (!S.clipboard || !S.clipboard.length) return;
-    edit(() => { S.sel = new Set(copyObjs(S.clipboard, 5, 5).map(o => o.id)); });
-    S.clipboard = S.clipboard.map(c => ({ ...c, tf: { ...c.tf, x: c.tf.x + 5, y: c.tf.y + 5 } }));
+  copy() {
+    if (!S.sel.size) return msg('Select something to copy');
+    S.clipboard = selected().map(o => ({ ...o, tf: { ...o.tf } })); S.clipShift = 0;
+    msg(`Copied ${S.clipboard.length} object(s)`);
+  },
+  cut() {
+    if (!S.sel.size || blockLocked(selected(), 'cut')) return;
+    S.clipboard = selected().map(o => ({ ...o, tf: { ...o.tf } })); S.clipShift = 0;
+    ACTIONS.del();
+  },
+  // Like LightBurn, Paste centres the copy on the mouse pointer (or on the right-clicked point). From the menu bar,
+  // where the pointer isn't over the design, each paste lands 5 mm further along instead.
+  paste(c) {
+    if (!S.clipboard || !S.clipboard.length) return msg('Nothing to paste — copy something first');
+    const at = c?.pt || (!c?.menubar && S.cursor);
+    if (at) return pasteAt(at);
+    S.clipShift += 5;
+    edit(() => { S.sel = new Set(copyObjs(S.clipboard, S.clipShift, S.clipShift).map(o => o.id)); });
+  },
+  'paste-place'() {
+    if (!S.clipboard || !S.clipboard.length) return msg('Nothing to paste — copy something first');
+    edit(() => { S.sel = new Set(copyObjs(S.clipboard, 0, 0).map(o => o.id)); });
   },
   dup() {
     const objs = selected(); if (!objs.length) return;
     edit(() => { S.sel = new Set(copyObjs(objs, 5, 5).map(o => o.id)); });
   },
   del() {
-    if (!S.sel.size) return;
+    if (!S.sel.size || blockLocked(selected(), 'deleted')) return;
     edit(() => { S.objects = S.objects.filter(o => !S.sel.has(o.id)); S.sel.clear(); S.node = null; });
   },
-  'select-all'() { S.sel = new Set(S.objects.map(o => o.id)); selectionChanged(); },
+  'select-all'() { S.sel = new Set(visibleObjects().map(o => o.id)); S.node = null; selectionChanged(); },
   group() {
     if (S.sel.size < 2) return msg('Select two or more objects to group');
     const g = uid(); edit(() => selected().forEach(o => { o.group = g; })); msg('Grouped', 'ok');
@@ -1402,7 +1759,7 @@ const ACTIONS = {
   'mirror-h'() { mirror(true); },
   'mirror-v'() { mirror(false); },
   'mirror-both'() {
-    const b = boundsOf(selected()); if (!b) return;
+    const b = boundsOf(selected()); if (!b || blockLocked(selected(), 'flipped')) return;
     const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
     edit(() => selected().forEach(o => { o.tf = reflectTf(reflectTf(o.tf, 0, cx, cy), 90, cx, cy); }));
   },
@@ -1474,20 +1831,18 @@ const ACTIONS = {
   'al-b'() { align((b, s) => [0, s.maxY - b.maxY]); },
   'dist-h'() { distribute(0); },
   'dist-v'() { distribute(1); },
-  center() {
-    const b = boundsOf(selected()); if (!b) return;
-    const dx = dev().bedW / 2 - (b.minX + b.maxX) / 2, dy = dev().bedH / 2 - (b.minY + b.maxY) / 2;
-    edit(() => selected().forEach(o => { o.tf = { ...o.tf, x: o.tf.x + dx, y: o.tf.y + dy }; }));
-  },
+  center() { moveSelTo(0.5, 0.5); },
   topath() {
     const objs = selected().filter(o => o.type !== 'path' && o.type !== 'image');
     if (!objs.length) return msg('Select text or shapes to convert');
+    if (blockLocked(objs, 'converted')) return;
     edit(() => objs.forEach(o => { const polys = localPolys(o); o.type = 'path'; o.polys = polys; }));
     msg(`Converted ${objs.length} object(s) to paths`, 'ok');
   },
   break() {
     const objs = selected().filter(o => o.type !== 'image' && localPolys(o).length > 1);
     if (!objs.length) return msg('Select a shape made of several sub-paths');
+    if (blockLocked(objs, 'broken apart')) return;
     edit(() => {
       S.sel.clear();
       for (const o of objs) {
@@ -1500,6 +1855,7 @@ const ACTIONS = {
   async join() {
     const objs = selected().filter(o => o.type !== 'image');
     if (!objs.length) return msg('Select the paths to join');
+    if (blockLocked(objs, 'joined')) return;
     const v = await formDialog('Auto-join', [{ key: 'tol', label: 'Join gaps up to (mm)', type: 'number', value: 0.1, min: 0 }], { ok: 'Join' });
     if (!v) return;
     const before = objs.reduce((a, o) => a + worldPolys(o).length, 0);
@@ -1514,6 +1870,7 @@ const ACTIONS = {
   'close-paths'() {
     const objs = selected().filter(o => o.type === 'path' && o.polys.some(p => !p.closed && p.pts.length >= 3));
     if (!objs.length) return msg('No open paths selected');
+    if (blockLocked(objs, 'changed')) return;
     edit(() => objs.forEach(o => { o.polys = o.polys.map(p => ({ ...p, closed: p.closed || p.pts.length >= 3 })); }));
   },
   weld() { boolAction('union', 'Weld'); },
@@ -1530,6 +1887,7 @@ const ACTIONS = {
       { key: 'del', label: 'Delete the original', type: 'check', value: false },
     ], { ok: 'Offset' });
     if (!v || !(v.dist > 0)) return;
+    if (v.del && blockLocked(objs, 'deleted')) return;
     try {
       const src = objs.flatMap(o => worldPolys(o));
       const polys = [];
@@ -1565,14 +1923,589 @@ const ACTIONS = {
   pack: () => packDialog(),
   'print-cut': () => printAndCutDialog(),
   csv: () => csvDialog(),
+  // ---- the rest of LightBurn's Edit menu
+  'invert-sel'() { S.sel = new Set(visibleObjects().filter(o => !S.sel.has(o.id)).map(o => o.id)); S.node = null; selectionChanged(); },
+  deselect() { S.sel.clear(); S.node = null; selectionChanged(); },
+  'sel-open'() { selectWhere(isOpenShape, 'open shape', 'open shapes'); },
+  'sel-open-fill'() { selectWhere(o => isOpenShape(o) && isFillLayer(layerById(o.layer)), 'open shape set to fill', 'open shapes set to fill'); },
+  'sel-layer'(c) {
+    const L = (c?.layerId && layerById(c.layerId)) || activeLayer();
+    selectWhere(o => o.layer === L.id, `shape on ${L.name}`, `shapes on ${L.name}`, `${L.name} has no visible shapes`);
+  },
+  'sel-contained': () => selectContained(),
+  'sel-smaller': () => selectSmaller(),
+  'to-bitmap': () => toBitmapDialog(),
+  'close-tol': () => closeTolDialog(),
+  optimize: () => optimizeDialog(),
+  dedupe: () => deleteDuplicates(),
+  'img-adjust'() {
+    const im = selected().filter(o => o.type === 'image');
+    if (!im.length) return msg('Select an image to adjust');
+    if (S.sel.size !== 1) { S.sel = new Set([im[0].id]); selectionChanged(); }
+    showTab('shape');
+  },
+  'img-invert'() {
+    const im = selected().filter(o => o.type === 'image');
+    if (!im.length) return msg('Select an image');
+    if (blockLocked(im, 'changed')) return;
+    const on = !im.every(o => o.invert);
+    edit(() => im.forEach(o => { o.invert = on; }));
+  },
+  'img-replace': () => replaceImage(false),
+  'img-replace-fit': () => replaceImage(true),
+  // ---- the rest of LightBurn's Arrange menu
+  'auto-group': () => autoGroup(),
+  lock() {
+    const objs = selected(); if (!objs.length) return msg('Select the shapes to lock');
+    edit(() => objs.forEach(o => { o.locked = true; }));
+    msg(`Locked ${plural(objs.length, 'shape', 'shapes')}: they can be selected and copied, but not moved, changed or deleted`, 'ok');
+  },
+  unlock() {
+    const objs = selected().filter(o => o.locked); if (!objs.length) return msg('None of the selected shapes are locked');
+    edit(() => objs.forEach(o => { delete o.locked; }));
+    msg(`Unlocked ${plural(objs.length, 'shape', 'shapes')}`, 'ok');
+  },
+  'al-c'() { align((b, s) => [(s.minX + s.maxX) / 2 - (b.minX + b.maxX) / 2, (s.minY + s.maxY) / 2 - (b.minY + b.maxY) / 2]); },
+  'together-h': () => moveTogether(0),
+  'together-v': () => moveTogether(1),
+  'move-tl': () => moveSelTo(0, 0), 'move-tc': () => moveSelTo(0.5, 0), 'move-tr': () => moveSelTo(1, 0),
+  'move-ml': () => moveSelTo(0, 0.5), 'move-mr': () => moveSelTo(1, 0.5),
+  'move-bl': () => moveSelTo(0, 1), 'move-bc': () => moveSelTo(0.5, 1), 'move-br': () => moveSelTo(1, 1),
+  'move-laser'() { // centre the selection on the laser head
+    if (!S.m.wpos) return msg('Connect to the laser first so its position is known', 'err');
+    const objs = selected(), b = boundsOf(objs); if (!b) return msg('Select something to move');
+    const [hx, hy] = machineToDesign(dev(), S.m.wpos[0], S.m.wpos[1]);
+    moveUnits(units(objs).map(u => [u, hx - (b.minX + b.maxX) / 2, hy - (b.minY + b.maxY) / 2]));
+  },
+  'move-by': () => moveByDialog(),
+  'dock-l': () => dockSel('left'), 'dock-r': () => dockSel('right'), 'dock-u': () => dockSel('up'), 'dock-d': () => dockSel('down'),
+  'dock-settings': () => dockSettingsDialog(),
+  'rot-180'() { rotateSel(180); },
+  'rot-by': () => rotateByDialog(),
+  'order-front': () => reorder('front'), 'order-fwd': () => reorder('fwd'), 'order-bwd': () => reorder('bwd'), 'order-back': () => reorder('back'),
+  'copy-path': () => copyAlongPathDialog(),
+  'rubber-band': () => rubberBand(),
+  // ---- view and right-click extras
+  'zoom-sel'() { const b = boundsOf(selected()); if (!b) return msg('Select something to zoom to'); zoomToBox(b); },
+  'zoom-in': () => zoomBy(1.25),
+  'zoom-out': () => zoomBy(0.8),
+  props: () => showTab('shape'),
+  'tool-select': () => setTool('select'),
+  'text-here'(c) { const [x, y] = c?.pt || viewCentre(); createText(x, y); },
+  async 'laser-here'(c) {
+    if (!S.m.connected) return msg('Connect to the laser first', 'err');
+    if (!inBed(c?.pt)) return msg('That point is outside the work area', 'err');
+    const [x, y] = mapToMachine(dev(), c.pt[0], c.pt[1]);
+    if (isRuida()) await machine.ruida('goto', { x, y }); else await machine.send(C().goTo(x, y));
+  },
+  'origin-here'(c) {
+    if (!inBed(c?.pt)) return msg('That point is outside the work area', 'err');
+    setUserOrigin(mapToMachine(dev(), c.pt[0], c.pt[1]));
+    if (settings.startFrom !== 'user') { settings.startFrom = 'user'; $('#j-start').value = 'user'; saveSettings(); syncAnchor(); }
+  },
 };
-function act(name) { closeMenus(); const f = ACTIONS[name]; if (f) f(); }
+// Run an action by name. ctx: the menu context (e.g. the right-clicked point) for actions that use it.
+function act(name, ctx) {
+  closeMenu();
+  const f = ACTIONS[name];
+  if (!f) return;
+  try {
+    const r = f(ctx);
+    if (r && typeof r.catch === 'function') r.catch(e => msg(e.message, 'err'));
+  } catch (e) { msg(e.message, 'err'); console.error(e); }
+}
 $$('[data-act]').forEach(b => b.addEventListener('click', () => act(b.dataset.act)));
+
+// ================================================================ menus (menu bar and right-click menus)
+const TYPE_LABEL = { rect: 'Rectangle', ellipse: 'Ellipse', polygon: 'Polygon', path: 'Path', text: 'Text', image: 'Image' };
+// What the menus need to know about the selection; extra: pt (right-clicked point), hit, menubar…
+function menuContext(extra = {}) {
+  const objs = selected(), us = units(objs);
+  return {
+    objs, us, n: objs.length, nu: us.length,
+    vec: objs.filter(o => o.type !== 'image'), imgs: objs.filter(o => o.type === 'image'),
+    locked: objs.some(o => o.locked), grouped: objs.some(o => o.group), pt: null, ...extra,
+  };
+}
+// Why a command can't run right now (the greyed-out item's tooltip), or false.
+const WHY = {
+  sel: c => !c.n && 'Select something first',
+  vec: c => !c.vec.length && 'Select one or more shapes (pictures don\'t count)',
+  vec2: c => c.vec.length < 2 && 'Select two or more shapes',
+  u2: c => c.nu < 2 && 'Select two or more objects',
+  u3: c => c.nu < 3 && 'Select three or more objects',
+  lock: c => c.locked && 'Locked — unlock it first',
+  clip: () => !S.clipboard?.length && 'Nothing has been copied yet',
+  undo: () => !S.undo.length && 'Nothing to undo',
+  redo: () => !S.redo.length && 'Nothing to redo',
+  conn: () => !S.m.connected && 'Connect to the laser first',
+  any: () => !visibleObjects().length && 'The design is empty',
+};
+const why = (c, ...keys) => { for (const k of keys) { const r = typeof k === 'function' ? k(c) : WHY[k](c); if (r) return r; } return false; };
+// Menu item running action `name`. o: { kbd, title, ctx, why: [WHY keys / functions] | function | reason }
+function mi(label, name, c, o = {}) {
+  const w = Array.isArray(o.why) ? why(c, ...o.why) : typeof o.why === 'function' ? o.why(c) : o.why;
+  return { label, kbd: o.kbd, title: o.title, disabled: w || false, run: () => act(name, o.ctx || c) };
+}
+const menuOpts = (extra = {}) => ({ onError: e => msg(e.message, 'err'), ...extra });
+
+function selectItems(c, all = true) {
+  const L = (c.hit && layerById(c.hit.layer)) || activeLayer();
+  return [
+    all && mi('Select all', 'select-all', c, { kbd: 'Ctrl+A', why: ['any'] }),
+    all && mi('Invert selection', 'invert-sel', c, { kbd: 'Ctrl+Shift+I', why: ['any'] }),
+    mi(`Select all shapes in layer “${L.name}”`, 'sel-layer', c, { ctx: { ...c, layerId: L.id }, why: !S.objects.some(o => o.layer === L.id) && 'That layer is empty' }),
+    mi('Select open shapes', 'sel-open', c, { why: ['any'] }),
+    mi('Select open shapes set to fill', 'sel-open-fill', c, { why: ['any'], title: 'Open shapes on Fill layers can\'t be filled — close them or move them to a Line layer' }),
+    mi('Select contained shapes', 'sel-contained', c, { why: () => !c.objs.some(hasClosed) && 'Select a closed shape first', title: 'Selects the shapes completely inside the selected ones' }),
+    mi('Select shapes smaller than selected', 'sel-smaller', c, { why: ['sel'], title: 'Selects every shape no bigger than the selected one — e.g. specks after tracing' }),
+    all && '-',
+    all && mi('Deselect', 'deselect', c, { kbd: 'Esc', why: ['sel'] }),
+  ];
+}
+const flipItems = c => [
+  mi('Flip horizontal', 'mirror-h', c, { kbd: 'Ctrl+Shift+H', why: ['sel', 'lock'] }),
+  mi('Flip vertical', 'mirror-v', c, { kbd: 'Ctrl+Shift+V', why: ['sel', 'lock'] }),
+  mi('Flip both (turn 180°)', 'mirror-both', c, { why: ['sel', 'lock'] }),
+  mi('Mirror copy to the right', 'mirror-copy-h', c, { why: ['sel'] }),
+  mi('Mirror copy below', 'mirror-copy-v', c, { why: ['sel'] }),
+  mi('Mirror across a line…', 'mirror-line', c, { kbd: 'Ctrl+Shift+M', why: ['sel'] }),
+  '-',
+  mi('Rotate 90° clockwise', 'rot-cw', c, { why: ['sel', 'lock'] }),
+  mi('Rotate 90° counter-clockwise', 'rot-ccw', c, { why: ['sel', 'lock'] }),
+  mi('Rotate 180°', 'rot-180', c, { why: ['sel', 'lock'] }),
+  mi('Rotate by angle…', 'rot-by', c, { why: ['sel', 'lock'] }),
+];
+function alignItems(c) {
+  const mode = settings.alignTo || 'auto';
+  const to = (label, v) => ({ label, radio: true, checked: mode === v, run: () => { settings.alignTo = v; saveSettings(); refreshPanels(); } });
+  return [
+    mi('Align left', 'al-l', c, { kbd: 'Ctrl+Shift+←', why: ['sel'] }),
+    mi('Align centres horizontally', 'al-hc', c, { why: ['sel'] }),
+    mi('Align right', 'al-r', c, { kbd: 'Ctrl+Shift+→', why: ['sel'] }),
+    mi('Align top', 'al-t', c, { kbd: 'Ctrl+Shift+↑', why: ['sel'] }),
+    mi('Align centres vertically', 'al-vc', c, { why: ['sel'] }),
+    mi('Align bottom', 'al-b', c, { kbd: 'Ctrl+Shift+↓', why: ['sel'] }),
+    mi('Align centres', 'al-c', c, { why: ['sel'] }),
+    '-', { heading: 'Align to' },
+    to('Selection (the bed for one object)', 'auto'), to('Selection', 'selection'), to('First selected object', 'key'), to('Bed', 'bed'),
+  ];
+}
+const distributeItems = c => [
+  mi('Distribute horizontally (equal gaps)', 'dist-h', c, { why: ['u3'] }),
+  mi('Distribute vertically (equal gaps)', 'dist-v', c, { why: ['u3'] }),
+  mi('Distribute centres horizontally', 'dist-hc', c, { why: ['u3'] }),
+  mi('Distribute centres vertically', 'dist-vc', c, { why: ['u3'] }),
+  '-',
+  mi('Move together horizontally', 'together-h', c, { kbd: 'Alt+Shift+H', why: ['u2'], title: 'Slides them sideways until they touch; the last one selected stays put' }),
+  mi('Move together vertically', 'together-v', c, { kbd: 'Alt+Shift+V', why: ['u2'], title: 'Slides them up or down until they touch; the last one selected stays put' }),
+  mi('Set spacing…', 'spacing', c, { why: ['u2'] }),
+  '-',
+  mi('Make same width', 'same-w', c, { why: ['u2'], title: 'As wide as the first one selected' }),
+  mi('Make same height', 'same-h', c, { why: ['u2'], title: 'As tall as the first one selected' }),
+  mi('Make same size', 'same-size', c, { why: ['u2'], title: 'The same size as the first one selected' }),
+];
+function moveItems(c) {
+  const w = ['sel', 'lock'];
+  return [
+    mi('Move to bed centre', 'center', c, { why: w }),
+    mi('Move to upper left', 'move-tl', c, { why: w }),
+    mi('Move to top centre', 'move-tc', c, { why: w }),
+    mi('Move to upper right', 'move-tr', c, { why: w }),
+    mi('Move to left centre', 'move-ml', c, { why: w }),
+    mi('Move to right centre', 'move-mr', c, { why: w }),
+    mi('Move to lower left', 'move-bl', c, { why: w }),
+    mi('Move to bottom centre', 'move-bc', c, { why: w }),
+    mi('Move to lower right', 'move-br', c, { why: w }),
+    mi('Move to laser position', 'move-laser', c, { why: [() => !S.m.wpos && 'Connect to the laser first', ...w] }),
+    mi('Move by…', 'move-by', c, { why: w }),
+    '-',
+    mi('Dock left', 'dock-l', c, { why: w }),
+    mi('Dock right', 'dock-r', c, { why: w }),
+    mi('Dock up', 'dock-u', c, { why: w }),
+    mi('Dock down', 'dock-d', c, { why: w }),
+    mi('Dock settings…', 'dock-settings', c),
+  ];
+}
+const orderItems = c => [
+  mi('Bring to front', 'order-front', c, { kbd: 'Ctrl+PgUp', why: ['sel'] }),
+  mi('Bring forward', 'order-fwd', c, { kbd: 'PgUp', why: ['sel'] }),
+  mi('Send backward', 'order-bwd', c, { kbd: 'PgDn', why: ['sel'] }),
+  mi('Send to back', 'order-back', c, { kbd: 'Ctrl+PgDn', why: ['sel'] }),
+];
+function pathItems(c) {
+  const open = c.objs.some(o => o.type === 'path' && o.polys.some(p => !p.closed && p.pts.length >= 3));
+  const noOpen = () => !open && 'No open paths selected';
+  return [
+    mi('Convert to path', 'topath', c, { kbd: 'Ctrl+Shift+C', why: [() => !c.objs.some(o => o.type !== 'path' && o.type !== 'image') && 'Select text or a shape (rectangle, ellipse, polygon)', 'lock'] }),
+    mi('Convert to bitmap…', 'to-bitmap', c, { kbd: 'Ctrl+Shift+B', why: ['vec', 'lock'] }),
+    '-',
+    mi('Close path', 'close-paths', c, { kbd: 'Alt+C', why: [noOpen, 'lock'] }),
+    mi('Close paths with tolerance…', 'close-tol', c, { why: [noOpen, 'lock'] }),
+    mi('Auto-join selected shapes…', 'join', c, { kbd: 'Alt+J', why: ['vec', 'lock'] }),
+    mi('Optimize selected shapes…', 'optimize', c, { kbd: 'Alt+Shift+O', why: [() => !c.objs.some(o => o.type === 'path') && 'Select paths (convert shapes or text to paths first)', 'lock'] }),
+    mi('Delete duplicates', 'dedupe', c, { kbd: 'Alt+D', why: () => S.objects.length < 2 && 'Nothing to compare', title: 'Deletes identical shapes stacked exactly on top of each other, anywhere in the design' }),
+    mi('Break apart', 'break', c, { kbd: 'Alt+B', why: [() => !c.vec.some(o => worldPolys(o).length > 1) && 'Select a shape made of several parts', 'lock'] }),
+  ];
+}
+const boolItems = c => [
+  mi('Weld', 'weld', c, { why: ['vec', 'lock'] }),
+  mi('Boolean subtract', 'subtract', c, { why: ['vec2', 'lock'], title: 'The bottom-most shape minus the others' }),
+  mi('Boolean intersect', 'intersect', c, { why: ['vec2', 'lock'] }),
+  mi('Boolean exclude (XOR)', 'xor', c, { why: ['vec2', 'lock'] }),
+  '-',
+  mi('Offset shapes…', 'offset', c, { kbd: 'Alt+O', why: ['vec'] }),
+  mi('Fillet (round) corners…', 'fillet', c, { why: ['vec', 'lock'] }),
+  mi('Chamfer corners…', 'chamfer', c, { why: ['vec', 'lock'] }),
+];
+const copyPathWhy = c => c.nu < 2 && 'Select the object to copy, then Shift-click the path';
+const arrayItems = c => [
+  mi('Grid array…', 'array', c, { why: ['sel'] }),
+  mi('Circular array…', 'circ-array', c, { why: ['sel'] }),
+  mi('Copy along path…', 'copy-path', c, { why: [copyPathWhy] }),
+  mi('Pack onto the bed…', 'pack', c, { why: ['lock'], title: 'Nest the selection (or everything) onto the bed' }),
+];
+function imageItems(c) {
+  const one = [() => c.imgs.length !== 1 && 'Select one image', 'lock'], any = () => !c.imgs.length && 'Select an image';
+  return [
+    mi('Adjust image…', 'img-adjust', c, { kbd: 'Alt+I', why: any, title: 'Brightness, contrast, gamma (Shape tab)' }),
+    mi('Trace image…', 'trace', c, { kbd: 'Alt+T', why: any }),
+    { label: 'Invert', checked: !!c.imgs.length && c.imgs.every(o => o.invert), disabled: why(c, any, 'lock'), run: () => act('img-invert', c) },
+    '-',
+    mi('Replace image…', 'img-replace', c, { why: one }),
+    mi('Replace image to fit…', 'img-replace-fit', c, { why: one, title: 'The new picture is fitted inside the old one\'s box' }),
+  ];
+}
+function moveSelToLayer(T) {
+  const objs = selected(); if (!objs.length) return;
+  edit(() => {
+    if (!T) { T = makeLayer(PALETTE.find(col => !S.layers.some(l => l.color === col)) || PALETTE[S.layers.length % PALETTE.length]); S.layers.push(T); }
+    S.activeLayer = T.id;
+    for (const o of objs) { o.layer = T.id; if (o.type === 'image') T.mode = 'image'; } // same rule as the colour palette
+  });
+  msg(`Moved ${plural(objs.length, 'object', 'objects')} to ${T.name}`, 'ok');
+}
+const layerPickItems = c => [
+  ...S.layers.map(L => ({ label: `${L.name} · ${MODE_LABEL[L.mode]}`, swatch: L.color, kbd: c.objs.every(o => o.layer === L.id) ? 'current' : '', run: () => moveSelToLayer(L) })),
+  '-',
+  { label: 'New layer', run: () => moveSelToLayer(null) },
+];
+function laserItems(c) {
+  const here = !!c.pt, out = () => !inBed(c.pt) && 'That point is outside the work area';
+  return [
+    here && mi('Move laser here', 'laser-here', c, { why: ['conn', out] }),
+    mi('Move laser to selection', 'goto-sel', c, { why: ['conn', 'sel'] }),
+    mi('Move selection to laser position', 'move-laser', c, { why: [() => !S.m.wpos && 'Connect to the laser first', 'sel', 'lock'] }),
+    '-',
+    here && mi('Set user origin here', 'origin-here', c, { why: [out], title: 'Jobs started from "User origin" put their anchor on this spot' }),
+    { label: 'Cut selected graphics only', checked: $('#j-selonly').checked, run: () => { const b = $('#j-selonly'); b.checked = !b.checked; changed(); } },
+  ];
+}
+// Layers: LightBurn's column-header menu (all layers) and layer-row menu.
+function setLayerShown(L, on) {
+  L.show = on;
+  if (!on) for (const o of S.objects) if (o.layer === L.id) S.sel.delete(o.id);
+}
+function allLayersItems() {
+  const air = isCnc(dev()) ? 'coolant / dust extraction' : 'air assist';
+  const each = fn => () => edit(() => S.layers.forEach(fn));
+  return [
+    { label: 'Enable all layers', run: each(L => { L.output = true; }) },
+    { label: 'Disable all layers', run: each(L => { L.output = false; }) },
+    { label: 'Invert enabled layers', run: each(L => { L.output = !L.output; }) },
+    '-',
+    { label: 'Show all layers', run: each(L => setLayerShown(L, true)) },
+    { label: 'Hide all layers', run: each(L => setLayerShown(L, false)) },
+    { label: 'Invert visible layers', run: each(L => setLayerShown(L, L.show === false)) },
+    '-',
+    { label: `Turn ${air} on for all layers`, run: each(L => { L.air = true; }) },
+    { label: `Turn ${air} off for all layers`, run: each(L => { L.air = false; }) },
+    { label: `Invert ${air} on all layers`, run: each(L => { L.air = !L.air; }) },
+    '-',
+    { label: 'Sort cuts last', title: 'Moves the Line (cutting) layers to the end, so engraving runs before parts are cut free',
+      run: () => edit(() => { S.layers = [...S.layers.filter(L => L.mode !== 'line'), ...S.layers.filter(L => L.mode === 'line')]; }) },
+  ];
+}
+function layerMenu(L) {
+  const i = S.layers.indexOf(L), n = S.objects.filter(o => o.layer === L.id).length;
+  const others = S.layers.filter(x => x !== L), empty = !n && 'This layer is empty';
+  return [
+    { heading: `${L.name} · ${MODE_LABEL[L.mode]} · ${plural(n, 'shape', 'shapes')}` },
+    { label: 'Make this the active layer', disabled: activeLayer() === L && 'It is already the active layer', title: 'New shapes go on the active layer', run: () => { S.activeLayer = L.id; refreshPanels(); } },
+    { label: 'Move selection to this layer', disabled: !S.sel.size && 'Nothing is selected', run: () => moveSelToLayer(L) },
+    '-',
+    { label: 'Select all shapes in this layer', kbd: 'Shift+click', disabled: empty || (L.show === false && 'The layer is hidden'), run: () => act('sel-layer', { layerId: L.id }) },
+    { label: 'Flash the content on this layer', kbd: 'Shift+right-click', disabled: empty, run: () => flashLayer(L.id) },
+    '-',
+    { label: 'Output this layer', checked: !!L.output, run: () => edit(() => { L.output = !L.output; }) },
+    { label: 'Disable all layers but this one', disabled: L.output && !others.some(x => x.output) && 'The other layers are already off', run: () => edit(() => { L.output = true; others.forEach(x => { x.output = false; }); }) },
+    { label: 'Show this layer', checked: L.show !== false, title: 'Hidden layers still burn while their Output is on', run: () => edit(() => setLayerShown(L, L.show === false)) },
+    { label: 'Hide all layers but this one', disabled: L.show !== false && !others.some(x => x.show !== false) && 'The other layers are already hidden', run: () => edit(() => { setLayerShown(L, true); others.forEach(x => setLayerShown(x, false)); }) },
+    '-',
+    { label: 'All layers', sub: allLayersItems() },
+    '-',
+    { label: 'Move up (runs earlier)', disabled: i === 0, run: () => edit(() => { S.layers.splice(i - 1, 0, S.layers.splice(i, 1)[0]); }) },
+    { label: 'Move down (runs later)', disabled: i === S.layers.length - 1, run: () => edit(() => { S.layers.splice(i + 1, 0, S.layers.splice(i, 1)[0]); }) },
+    { label: 'Save as a material preset…', run: () => { S.activeLayer = L.id; refreshPanels(); savePresetDialog(); } },
+    { label: 'Delete layer', disabled: n ? 'Only empty layers can be deleted' : S.layers.length < 2 && 'The last layer can\'t be deleted',
+      run: () => edit(() => { S.layers = S.layers.filter(x => x !== L); if (S.activeLayer === L.id) S.activeLayer = S.layers[0].id; }) },
+  ];
+}
+function flashLayer(id) {
+  if (!S.objects.some(o => o.layer === id)) return msg('That layer is empty');
+  clearInterval(flashLayer.t);
+  let n = 0;
+  S.flash = { layer: id, on: true }; requestDraw();
+  flashLayer.t = setInterval(() => {
+    if (++n >= 6) { clearInterval(flashLayer.t); S.flash = null; } else S.flash.on = !S.flash.on;
+    requestDraw();
+  }, 170);
+}
+
+// ---- canvas right-click menu
+function selectionTitle(c) {
+  const b = boundsOf(c.objs);
+  const what = c.n === 1 ? (c.objs[0].name || TYPE_LABEL[c.objs[0].type] || 'Object') : c.nu === 1 && c.objs[0].group ? `Group of ${c.n}` : `${c.n} objects`;
+  return `${what} · ${+(b.maxX - b.minX).toFixed(2)} × ${+(b.maxY - b.minY).toFixed(2)} mm${c.locked ? ' · locked' : ''}`;
+}
+function canvasMenu(c) {
+  const head = [
+    S.tool !== 'select' && mi('Select tool', 'tool-select', c, { kbd: 'V' }),
+    S.measure && { label: 'Clear measurement', run: () => { S.measure = null; requestDraw(); } },
+    '-',
+    mi('Undo', 'undo', c, { kbd: 'Ctrl+Z', why: ['undo'] }),
+    mi('Redo', 'redo', c, { kbd: 'Ctrl+Y', why: ['redo'] }),
+    '-',
+  ];
+  const paste = [
+    mi('Paste', 'paste', c, { kbd: 'Ctrl+V', why: ['clip'], title: 'Pastes centred where you right-clicked' }),
+    mi('Paste in place', 'paste-place', c, { kbd: 'Alt+V', why: ['clip'] }),
+  ];
+  if (!c.n) {
+    return [...head, ...paste, '-',
+      mi('Select all', 'select-all', c, { kbd: 'Ctrl+A', why: ['any'] }),
+      { label: 'Select', sub: selectItems(c, false) },
+      '-',
+      mi('Add text here…', 'text-here', c),
+      mi('Import…', 'import', c, { kbd: 'Ctrl+I' }),
+      mi('QR code…', 'qr', c),
+      '-',
+      { label: 'Laser', sub: laserItems(c) },
+      { label: 'Layers', sub: allLayersItems() },
+      '-',
+      mi('Zoom to bed', 'fit', c, { kbd: 'F' }),
+      { label: 'Preview', kbd: 'Alt+P', checked: S.previewOn, run: () => act('preview') },
+    ];
+  }
+  return [{ heading: selectionTitle(c) }, ...head,
+    mi('Cut', 'cut', c, { kbd: 'Ctrl+X', why: ['lock'] }),
+    mi('Copy', 'copy', c, { kbd: 'Ctrl+C' }),
+    mi('Duplicate', 'dup', c, { kbd: 'Ctrl+D' }),
+    ...paste,
+    mi('Delete', 'del', c, { kbd: 'Del', why: ['lock'] }),
+    '-',
+    { label: 'Select', sub: selectItems(c) },
+    mi('Group', 'group', c, { kbd: 'Ctrl+G', why: ['u2'] }),
+    mi('Ungroup', 'ungroup', c, { kbd: 'Ctrl+U', why: () => !c.grouped && 'Nothing grouped is selected' }),
+    mi('Auto-group', 'auto-group', c, { title: 'Groups each outer shape with the shapes fully inside it' }),
+    c.locked ? mi('Unlock selected shapes', 'unlock', c) : mi('Lock selected shapes', 'lock', c, { title: 'Locked shapes can be selected and copied, but not moved, changed or deleted' }),
+    '-',
+    { label: 'Flip & rotate', sub: flipItems(c) },
+    { label: 'Align', sub: alignItems(c) },
+    { label: 'Distribute & size', sub: distributeItems(c) },
+    { label: 'Move', sub: moveItems(c) },
+    { label: 'Draw order', sub: orderItems(c) },
+    '-',
+    { label: 'Path tools', sub: [...pathItems(c), mi('Create rubber-band outline', 'rubber-band', c), '-', mi('Edit nodes', 'tool-node', c, { kbd: 'N' })] },
+    { label: 'Boolean & offset', sub: boolItems(c) },
+    { label: 'Array & copy', sub: arrayItems(c) },
+    c.imgs.length ? { label: 'Image', sub: imageItems(c) } : null,
+    { label: 'Move to layer', sub: layerPickItems(c) },
+    '-',
+    { label: 'Laser', sub: laserItems(c) },
+    mi('Zoom to selection', 'zoom-sel', c, { kbd: 'Ctrl+Shift+A' }),
+    mi('Properties', 'props', c, { title: 'Size, position and settings in the Shape tab' }),
+  ];
+}
+function draftMenu() {
+  const n = S.draft.pts.length;
+  return [
+    { heading: `Drawing a line · ${plural(n, 'point', 'points')}` },
+    { label: 'Finish line', kbd: 'Enter', disabled: n < 2 && 'Click at least two points first', run: () => finishLine(false) },
+    { label: 'Close shape', disabled: n < 3 && 'Needs three or more points', run: () => finishLine(true) },
+    { label: 'Remove last point', kbd: 'Backspace', run: removeLastPoint },
+    { label: 'Cancel line', kbd: 'Esc', run: () => { S.draft = null; requestDraw(); } },
+  ];
+}
+const previewMenu = () => [
+  { label: 'Close preview', kbd: 'Esc', run: () => act('preview') },
+  { label: 'Zoom to bed', kbd: 'F', run: zoomFit },
+  '-',
+  { label: 'Save G-code / Ruida RD file…', kbd: 'Ctrl+E', run: () => act('export') },
+];
+// Edit nodes mode: right-click on a node or on a line of the selected shape.
+function nodeMenu(c, sx, sy) {
+  const nh = nodeHit(sx, sy), seg = nh ? null : segmentHit(c.pt[0], c.pt[1]);
+  if (!nh && !seg) return null;
+  const o = nh ? S.objects.find(x => x.id === nh.id) : seg.o;
+  const pi = nh ? nh.pi : seg.pi, p = worldPolys(o)[pi], n = p.pts.length;
+  const lk = o.locked && 'Locked — unlock it first';
+  const closeItem = !p.closed && n >= 3 && { label: 'Close this path', disabled: lk, run: () => closeSubpath(o, pi) };
+  const tail = ['-', mi('Undo', 'undo', c, { kbd: 'Ctrl+Z', why: ['undo'] }), mi('Select tool', 'tool-select', c, { kbd: 'V' })];
+  if (nh) {
+    S.node = nh; requestDraw();
+    const end = !p.closed && (nh.vi === 0 || nh.vi === n - 1);
+    return [{ heading: `Node ${nh.vi + 1} of ${n}${p.closed ? '' : ' · open path'}` },
+      { label: 'Delete node', kbd: 'D', disabled: lk, run: deleteNode },
+      { label: 'Break shape at this node', kbd: 'B', disabled: lk || (end && 'Already an end of the path'), run: () => breakNode(o, pi, nh.vi) },
+      closeItem, ...tail];
+  }
+  const a = p.pts[seg.i - 1], b = p.pts[seg.i % n];
+  return [{ heading: 'Line segment' },
+    { label: 'Add node here', kbd: 'I', disabled: lk, run: () => insertNode(o, pi, seg.i, c.pt) },
+    { label: 'Add node at the midpoint', disabled: lk, run: () => insertNode(o, pi, seg.i, [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]) },
+    { label: 'Delete this segment', disabled: lk, title: 'Opens a closed shape here, or splits an open path in two', run: () => deleteSegment(o, pi, seg.i) },
+    closeItem, ...tail];
+}
+// sx, sy: canvas pixels. A right-click on an unselected shape selects it first, as in LightBurn.
+function openCanvasMenu(sx, sy, keyboard = false) {
+  const r = cv.getBoundingClientRect(), pt = toWorld(sx, sy);
+  let items = null;
+  if (S.previewOn) items = previewMenu();
+  else if (S.draft?.kind === 'line') items = draftMenu();
+  else {
+    const hit = keyboard ? null : hitTest(pt[0], pt[1]);
+    if (hit && !S.sel.has(hit.id)) { S.sel = S.tool === 'node' ? new Set([hit.id]) : withGroups([hit.id]); S.node = null; selectionChanged(); }
+    if (S.tool === 'node' && !keyboard) items = nodeMenu(menuContext({ pt }), sx, sy);
+    if (!items) items = canvasMenu(menuContext({ pt, hit }));
+  }
+  openMenu(items, r.left + sx, r.top + sy, menuOpts({ keyboard }));
+}
+cv.addEventListener('contextmenu', e => { e.preventDefault(); if (!drag) openCanvasMenu(e.offsetX, e.offsetY); });
+// Menu key or Shift+F10: the same menu at the selection (or the middle of the view).
+function openCanvasMenuAtSelection() {
+  const r = cv.getBoundingClientRect(), b = boundsOf(selected());
+  const [sx, sy] = b ? toScreen((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2) : [r.width / 2, r.height / 2];
+  openCanvasMenu(clamp(sx, 8, r.width - 8), clamp(sy, 8, r.height - 8), true);
+}
+// The Menu key also sends a contextmenu event to the focused element: don't let a browser menu cover ours.
+document.addEventListener('contextmenu', e => { if (isMenuOpen() && !e.target.closest?.('.ctx-menu')) e.preventDefault(); });
+$('#layer-list').addEventListener('contextmenu', e => {
+  if (e.target.closest('.layer-row')) return;
+  e.preventDefault();
+  openMenu(allLayersItems(), e.clientX, e.clientY, menuOpts());
+});
+
+// ---- menu bar
+const BAR = {
+  file: c => [
+    mi('New project', 'new', c),
+    mi('Open project…', 'open', c, { kbd: 'Ctrl+O' }),
+    mi('Save project', 'save', c, { kbd: 'Ctrl+S' }),
+    '-',
+    mi('Import SVG / DXF / PLT / image…', 'import', c, { kbd: 'Ctrl+I' }),
+    mi('Export SVG…', 'export-svg', c),
+    mi('Export DXF…', 'export-dxf', c),
+    '-',
+    mi('Save G-code / Ruida RD file…', 'export', c, { kbd: 'Ctrl+E' }),
+    mi('Run a G-code file on the laser…', 'run-file', c),
+  ],
+  edit: c => [
+    mi('Undo', 'undo', c, { kbd: 'Ctrl+Z', why: ['undo'] }),
+    mi('Redo', 'redo', c, { kbd: 'Ctrl+Y', why: ['redo'] }),
+    '-',
+    mi('Cut', 'cut', c, { kbd: 'Ctrl+X', why: ['sel', 'lock'] }),
+    mi('Copy', 'copy', c, { kbd: 'Ctrl+C', why: ['sel'] }),
+    mi('Paste', 'paste', c, { kbd: 'Ctrl+V', why: ['clip'] }),
+    mi('Paste in place', 'paste-place', c, { kbd: 'Alt+V', why: ['clip'] }),
+    mi('Duplicate', 'dup', c, { kbd: 'Ctrl+D', why: ['sel'] }),
+    mi('Delete', 'del', c, { kbd: 'Del', why: ['sel', 'lock'] }),
+    '-',
+    mi('Select all', 'select-all', c, { kbd: 'Ctrl+A', why: ['any'] }),
+    mi('Invert selection', 'invert-sel', c, { kbd: 'Ctrl+Shift+I', why: ['any'] }),
+    { label: 'Select', sub: selectItems(c, false) },
+    '-',
+    ...pathItems(c),
+    '-',
+    { label: 'Image', sub: imageItems(c) },
+    '-',
+    mi('Preferences…', 'settings', c),
+  ],
+  arrange: c => [
+    mi('Group', 'group', c, { kbd: 'Ctrl+G', why: ['u2'] }),
+    mi('Ungroup', 'ungroup', c, { kbd: 'Ctrl+U', why: () => !c.grouped && 'Nothing grouped is selected' }),
+    mi('Auto-group', 'auto-group', c, { title: 'Groups each outer shape with the shapes fully inside it (the whole design if nothing is selected)' }),
+    mi('Lock selected shapes', 'lock', c, { why: ['sel'] }),
+    mi('Unlock selected shapes', 'unlock', c, { why: () => !c.locked && 'Nothing locked is selected' }),
+    '-',
+    { label: 'Flip & rotate', sub: flipItems(c) },
+    { label: 'Align', sub: alignItems(c) },
+    { label: 'Distribute & size', sub: distributeItems(c) },
+    { label: 'Move', sub: moveItems(c) },
+    { label: 'Draw order', sub: orderItems(c) },
+    '-',
+    mi('Grid array…', 'array', c, { why: ['sel'] }),
+    mi('Circular array…', 'circ-array', c, { why: ['sel'] }),
+    mi('Copy along path…', 'copy-path', c, { why: [copyPathWhy] }),
+    mi('Create rubber-band outline', 'rubber-band', c, { why: ['sel'] }),
+  ],
+  tools: c => [
+    ...boolItems(c),
+    '-',
+    mi('Trace image…', 'trace', c, { kbd: 'Alt+T', why: () => !c.imgs.length && 'Select an image to trace' }),
+    mi('QR code…', 'qr', c),
+    mi('Variable text data (CSV merge)…', 'csv', c),
+    mi('Pack onto the bed…', 'pack', c, { why: ['lock'] }),
+    '-',
+    mi('Edit nodes', 'tool-node', c, { kbd: 'N' }),
+    mi('Measure', 'tool-measure', c, { kbd: 'M' }),
+  ],
+  laser: c => [
+    mi('Devices…', 'devices', c),
+    mi('Machine settings…', 'machine-settings', c),
+    mi('Rotary setup…', 'rotary', c),
+    mi('Edit macros…', 'macros', c),
+    '-',
+    mi('Material library…', 'library', c),
+    mi('Material test…', 'material-test', c),
+    mi('Print and cut…', 'print-cut', c),
+    '-',
+    mi('Move laser to selection', 'goto-sel', c, { why: ['conn', 'sel'] }),
+    mi('Move selection to laser position', 'move-laser', c, { why: [() => !S.m.wpos && 'Connect to the laser first', 'sel', 'lock'] }),
+    mi('User origin…', 'user-origin', c),
+  ],
+  view: c => [
+    mi('Zoom to bed', 'fit', c, { kbd: 'F' }),
+    mi('Zoom to selection', 'zoom-sel', c, { kbd: 'Ctrl+Shift+A', why: ['sel'] }),
+    mi('Zoom in', 'zoom-in', c, { kbd: '+' }),
+    mi('Zoom out', 'zoom-out', c, { kbd: '−' }),
+    '-',
+    { label: 'Preview', kbd: 'Alt+P', checked: S.previewOn, run: () => act('preview') },
+  ],
+};
+function openBarMenu(btn, keyboard = false) {
+  openMenu(BAR[btn.dataset.menu](menuContext({ menubar: true })), 0, 0, menuOpts({
+    anchor: btn, keyboard,
+    onClose: () => btn.classList.remove('open'),
+    onLeft: () => stepBarMenu(btn, -1), onRight: () => stepBarMenu(btn, 1),
+  }));
+  btn.classList.add('open');
+}
+function stepBarMenu(btn, d) {
+  const all = $$('.menu-btn');
+  openBarMenu(all[(all.indexOf(btn) + d + all.length) % all.length], true);
+}
+$$('.menu-btn').forEach(b => {
+  b.addEventListener('click', e => { if (menuAnchor() === b) closeMenu(); else openBarMenu(b, e.detail === 0); });
+  b.addEventListener('mouseenter', () => { const a = menuAnchor(); if (a && a !== b && a.classList.contains('menu-btn')) openBarMenu(b); });
+  b.addEventListener('keydown', e => { if (e.key === 'ArrowDown') { e.preventDefault(); openBarMenu(b, true); } });
+});
 
 // Mirror the selection across a line at `deg` (0 = horizontal line, 90 = vertical) through (cx, cy).
 // With copy, the originals stay and mirrored copies are added (and selected).
 function mirrorSel(deg, { copy = false, at } = {}) {
   const objs = selected(), b = boundsOf(objs); if (!b) return msg('Select something to mirror');
+  if (!copy && blockLocked(objs, 'flipped')) return;
   const [cx, cy] = at || [(b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2];
   edit(() => {
     const list = copy ? copyObjs(objs, 0, 0) : objs;
@@ -1600,6 +2533,7 @@ async function mirrorLineDialog() {
 async function filletDialog(preset = {}) {
   const objs = selected().filter(o => o.type !== 'image');
   if (!objs.length) return msg('Select one or more shapes to round their corners');
+  if (blockLocked(objs, 'changed')) return;
   const F = settings.fillet || { style: 'round', radius: 3, minTurn: 10 };
   const v = await formDialog('Fillet / chamfer corners', [
     { key: 'style', label: 'Corner style', type: 'select', value: preset.style || F.style, options: [['round', 'Round (fillet)'], ['chamfer', 'Straight cut (chamfer)']] },
@@ -1622,7 +2556,8 @@ async function filletDialog(preset = {}) {
   msg(corners ? `${v.style === 'chamfer' ? 'Chamfered' : 'Rounded'} ${corners} corner(s)` : 'No corners sharp enough to change', corners ? 'ok' : '');
 }
 function rotateSel(deg) {
-  const b = boundsOf(selected()); if (!b) return;
+  const b = boundsOf(selected()); if (!b) return msg('Select something to rotate');
+  if (blockLocked(selected(), 'rotated')) return;
   edit(() => applyRotate(origOf(selected()), deg, (b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2));
 }
 // Units for align/distribute: groups move together.
@@ -1645,7 +2580,7 @@ function align(fn) {
   if (mode === 'bed' || (mode === 'auto' && us.length === 1)) target = bedBox();
   else if (mode === 'key') { const k = keyUnit(us); target = k.b; movers = us.filter(u => u !== k); }
   else target = boundsOf(objs);
-  edit(() => movers.forEach(u => { const [dx, dy] = fn(u.b, target); u.list.forEach(o => { o.tf = { ...o.tf, x: o.tf.x + dx, y: o.tf.y + dy }; }); }));
+  moveUnits(movers.map(u => [u, ...fn(u.b, target)])); // a locked object can still be the one others align to
 }
 const moveUnit = (u, dx, dy) => u.list.forEach(o => { o.tf = { ...o.tf, x: o.tf.x + dx, y: o.tf.y + dy }; });
 // Spread centres evenly between the outermost centres.
@@ -1655,7 +2590,7 @@ function distributeCentres(axis) {
   const c = u => axis ? (u.b.minY + u.b.maxY) / 2 : (u.b.minX + u.b.maxX) / 2;
   us.sort((a, b) => c(a) - c(b));
   const a = c(us[0]), step = (c(us[us.length - 1]) - a) / (us.length - 1);
-  edit(() => us.forEach((u, i) => { const d = a + step * i - c(u); moveUnit(u, axis ? 0 : d, axis ? d : 0); }));
+  moveUnits(us.map((u, i) => { const d = a + step * i - c(u); return [u, axis ? 0 : d, axis ? d : 0]; }));
 }
 // Exact gap between neighbours, left-to-right (or top-to-bottom), starting at the first one.
 async function spacingDialog() {
@@ -1669,16 +2604,17 @@ async function spacingDialog() {
   settings.gap = v.gap; saveSettings();
   const ax = v.axis === 'v', lo = ax ? 'minY' : 'minX', hi = ax ? 'maxY' : 'maxX';
   us.sort((a, b) => a.b[lo] - b.b[lo]);
-  edit(() => {
-    let pos = us[0].b[lo];
-    for (const u of us) { const d = pos - u.b[lo]; moveUnit(u, ax ? 0 : d, ax ? d : 0); pos += u.b[hi] - u.b[lo] + v.gap; }
-  });
+  const moves = [];
+  let pos = us[0].b[lo];
+  for (const u of us) { const d = pos - u.b[lo]; moves.push([u, ax ? 0 : d, ax ? d : 0]); pos += u.b[hi] - u.b[lo] + v.gap; }
+  moveUnits(moves);
 }
 // Make every selected object the same width and/or height as the key (first selected) object.
 function sameSize(w, h) {
   const us = units(selected());
   if (us.length < 2) return msg('Select two or more objects (the first one selected sets the size)');
   const k = keyUnit(us), KW = k.b.maxX - k.b.minX, KH = k.b.maxY - k.b.minY;
+  if (blockLocked(us.filter(u => u !== k).flatMap(u => u.list), 'resized')) return;
   edit(() => us.forEach(u => {
     if (u === k) return;
     const W = u.b.maxX - u.b.minX || 1, H = u.b.maxY - u.b.minY || 1;
@@ -1692,15 +2628,336 @@ function distribute(axis) {
   us.sort((a, b) => a.b[lo] - b.b[lo]);
   const span = us[us.length - 1].b[hi] - us[0].b[lo], total = us.reduce((s, u) => s + u.b[hi] - u.b[lo], 0);
   const gap = (span - total) / (us.length - 1);
-  edit(() => {
-    let pos = us[0].b[lo];
-    for (const u of us) {
-      const d = pos - u.b[lo];
-      u.list.forEach(o => { o.tf = axis ? { ...o.tf, y: o.tf.y + d } : { ...o.tf, x: o.tf.x + d }; });
-      pos += u.b[hi] - u.b[lo] + gap;
-    }
-  });
+  const moves = [];
+  let pos = us[0].b[lo];
+  for (const u of us) {
+    const d = pos - u.b[lo];
+    moves.push([u, axis ? 0 : d, axis ? d : 0]);
+    pos += u.b[hi] - u.b[lo] + gap;
+  }
+  moveUnits(moves);
 }
+
+// ================================================================ LightBurn-style extras (Edit / Arrange menus)
+const isOpenShape = o => o.type === 'path' && o.polys.some(p => !p.closed && p.pts.length >= 2);
+const isFillLayer = L => !!L && (L.mode === 'fill' || L.mode === 'offset');
+const hasClosed = o => worldPolys(o).some(p => p.closed && p.pts.length >= 3);
+const isInside = (o, c) => o !== c && hasClosed(c) && polysInside(worldPolys(o), worldPolys(c), objBounds(o), objBounds(c));
+const inBed = p => !!p && p[0] >= 0 && p[1] >= 0 && p[0] <= dev().bedW && p[1] <= dev().bedH;
+const boxArea = b => (b.maxX - b.minX) * (b.maxY - b.minY);
+const showTab = name => $(`.tabs [data-tab="${name}"]`)?.click();
+const plural = (n, one, many) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+function selectWhere(pred, one, many, none = `No ${many} found`) {
+  const ids = visibleObjects().filter(pred).map(o => o.id);
+  S.sel = new Set(ids); S.node = null; selectionChanged();
+  msg(ids.length ? `Selected ${plural(ids.length, one, many)}` : none, ids.length ? 'ok' : '');
+}
+// Shapes completely inside the selected closed shapes (the outer shapes themselves end up deselected).
+function selectContained() {
+  const outer = selected().filter(hasClosed);
+  if (!outer.length) return msg('Select one or more closed shapes first');
+  const ids = new Set(outer.map(o => o.id));
+  selectWhere(o => !ids.has(o.id) && outer.some(c => isInside(o, c)), 'shape inside', 'shapes inside', 'No shapes are fully inside the selection');
+}
+// Everything no bigger than the largest selected shape — handy for clearing specks after tracing.
+function selectSmaller() {
+  const objs = selected(); if (!objs.length) return msg('Select a shape first: everything up to its size gets selected');
+  let W = 0, H = 0;
+  for (const o of objs) { const b = objBounds(o); W = Math.max(W, b.maxX - b.minX); H = Math.max(H, b.maxY - b.minY); }
+  selectWhere(o => { const b = objBounds(o); return b.maxX - b.minX <= W + 1e-6 && b.maxY - b.minY <= H + 1e-6; },
+    'shape this size or smaller', 'shapes this size or smaller');
+}
+// Each outermost closed shape is grouped with all the shapes fully inside it; shapes partly outside are left out.
+// Works on the selection; with one shape selected, groups it with what's inside it; with nothing selected, the
+// whole design.
+function autoGroup() {
+  const sel = selected(), pool = sel.length >= 2 ? sel : visibleObjects();
+  if (pool.length < 2) return msg('Nothing to group');
+  const outer = sel.length === 1 ? sel.filter(hasClosed) : pool.filter(a => !pool.some(c => isInside(a, c)));
+  const groups = new Map();
+  for (const a of pool) {
+    if (outer.includes(a)) continue;
+    const hosts = outer.filter(c => isInside(a, c)).sort((x, y) => boxArea(objBounds(x)) - boxArea(objBounds(y)));
+    if (!hosts.length) continue;
+    if (!groups.has(hosts[0])) groups.set(hosts[0], [hosts[0]]);
+    groups.get(hosts[0]).push(a);
+  }
+  if (!groups.size) return msg('No shapes were found inside other shapes');
+  edit(() => {
+    for (const list of groups.values()) { const g = uid(); list.forEach(o => { o.group = g; }); }
+    S.sel = new Set([...groups.values()].flat().map(o => o.id));
+  });
+  msg(`Auto-group: made ${plural(groups.size, 'group', 'groups')}`, 'ok');
+}
+// The unit holding the object selected last (Shift-click order): LightBurn's anchor for "move together".
+function lastUnit(us) {
+  const ids = [...S.sel], last = ids[ids.length - 1];
+  return us.find(u => u.list.some(o => o.id === last)) || us[us.length - 1];
+}
+// Slide objects along one axis until they touch, keeping the last-selected one still.
+function moveTogether(axis) {
+  const us = units(selected());
+  if (us.length < 2) return msg('Select two or more objects (the last one selected stays where it is)');
+  const lo = axis ? 'minY' : 'minX', hi = axis ? 'maxY' : 'maxX', c = u => (u.b[lo] + u.b[hi]) / 2;
+  const anchor = lastUnit(us), moves = [];
+  const mv = (u, d) => moves.push([u, axis ? 0 : d, axis ? d : 0]);
+  let edge = anchor.b[lo];
+  for (const u of us.filter(u => u !== anchor && c(u) <= c(anchor)).sort((a, b) => c(b) - c(a))) { const d = edge - u.b[hi]; mv(u, d); edge = u.b[lo] + d; }
+  edge = anchor.b[hi];
+  for (const u of us.filter(u => u !== anchor && c(u) > c(anchor)).sort((a, b) => c(a) - c(b))) { const d = edge - u.b[lo]; mv(u, d); edge = u.b[hi] + d; }
+  moveUnits(moves);
+}
+// Put the selection's box at a spot on the bed: fx, fy = 0 (left / top), 0.5 (centre) or 1 (right / bottom).
+function moveSelTo(fx, fy) {
+  const objs = selected(), b = boundsOf(objs); if (!b) return msg('Select something to move');
+  const d = dev(), dx = fx * (d.bedW - (b.maxX - b.minX)) - b.minX, dy = fy * (d.bedH - (b.maxY - b.minY)) - b.minY;
+  moveUnits(units(objs).map(u => [u, dx, dy]));
+}
+async function moveByDialog() {
+  const objs = selected(); if (!objs.length) return msg('Select something to move');
+  if (blockLocked(objs, 'moved')) return;
+  const M = settings.moveBy || { x: 10, y: 0 };
+  const v = await formDialog('Move selection', [
+    { key: 'x', label: 'Move X by (mm)', type: 'number', value: M.x },
+    { key: 'y', label: 'Move Y by (mm)', type: 'number', value: M.y },
+    { key: 'n', type: 'note', label: 'In the machine\'s X and Y directions, the same as the X and Y boxes in the Shape tab.' },
+  ], { ok: 'Move' });
+  if (!v || !Number.isFinite(v.x) || !Number.isFinite(v.y)) return;
+  settings.moveBy = { x: v.x, y: v.y }; saveSettings();
+  const d = dev(), right = d.origin === 'tr' || d.origin === 'br', front = d.origin === 'bl' || d.origin === 'br';
+  moveUnits(units(objs).map(u => [u, v.x * (right ? -1 : 1), v.y * (front ? -1 : 1)]));
+}
+async function rotateByDialog() {
+  if (!S.sel.size) return msg('Select something to rotate');
+  if (blockLocked(selected(), 'rotated')) return;
+  const v = await formDialog('Rotate selection', [
+    { key: 'deg', label: 'Angle (°, positive turns clockwise)', type: 'number', value: settings.rotBy ?? 45 },
+  ], { ok: 'Rotate' });
+  if (!v || !Number.isFinite(v.deg)) return;
+  settings.rotBy = v.deg; saveSettings();
+  rotateSel(v.deg);
+}
+// Shapes inside another selected shape's outline travel with it when docking.
+function mergeContained(us) {
+  const out = [];
+  for (const u of us.slice().sort((a, b) => boxArea(b.b) - boxArea(a.b))) {
+    const host = out.find(h => u.list.every(o => h.list.some(c => isInside(o, c))));
+    if (host) host.list.push(...u.list); else out.push({ list: u.list.slice(), b: u.b });
+  }
+  return out;
+}
+// Dock: slide the selection until it touches another object or the edge of the bed (bounding boxes).
+function dockSel(dir) {
+  const objs = selected(); if (!objs.length) return msg('Select something to dock');
+  const D = settings.dock || { pad: 0, together: false };
+  const ids = new Set(objs.map(o => o.id));
+  const movers = D.together ? [{ list: objs, b: boundsOf(objs) }] : mergeContained(units(objs));
+  const others = units(visibleObjects().filter(o => !ids.has(o.id))).map(u => u.b);
+  const deltas = dockBoxes(movers.map(u => u.b), others, bedBox(), dir, D.pad || 0);
+  if (!moveUnits(movers.map((u, i) => [u, ...deltas[i]])) && !objs.some(o => o.locked)) msg('Already docked: something is in the way');
+}
+async function dockSettingsDialog() {
+  const D = settings.dock || { pad: 0, together: false };
+  const v = await formDialog('Dock settings', [
+    { key: 'pad', label: 'Gap to leave (mm)', type: 'number', value: D.pad, min: 0 },
+    { key: 'together', label: 'Move the selection as one block (otherwise each object docks on its own)', type: 'check', value: D.together },
+    { key: 'n', type: 'note', label: 'Dock slides the selection left, right, up or down until it touches another object or the edge of the bed. Shapes inside a selected shape move with it. Objects are treated as their bounding boxes.' },
+  ], { ok: 'Save' });
+  if (!v) return;
+  settings.dock = { pad: Math.max(0, v.pad || 0), together: v.together }; saveSettings();
+}
+// Draw order: later objects are drawn on top, picked first by a click and used last by Subtract.
+function reorder(kind) {
+  if (!S.sel.size) return msg('Select something first');
+  const on = o => S.sel.has(o.id);
+  let a = S.objects.slice();
+  if (kind === 'front') a = [...a.filter(o => !on(o)), ...a.filter(on)];
+  else if (kind === 'back') a = [...a.filter(on), ...a.filter(o => !on(o))];
+  else if (kind === 'fwd') { for (let i = a.length - 2; i >= 0; i--) if (on(a[i]) && !on(a[i + 1])) [a[i], a[i + 1]] = [a[i + 1], a[i]]; }
+  else { for (let i = 1; i < a.length; i++) if (on(a[i]) && !on(a[i - 1])) [a[i], a[i - 1]] = [a[i - 1], a[i]]; }
+  if (a.every((o, i) => o === S.objects[i])) return msg(kind === 'front' || kind === 'fwd' ? 'Already at the front' : 'Already at the back');
+  edit(() => { S.objects = a; });
+}
+// Copy along path: copies of the other selected objects, centred on evenly spaced points of the path.
+// The path is the object selected last (select the object, then Shift-click the path), as in LightBurn.
+async function copyAlongPathDialog() {
+  const us = units(selected());
+  if (us.length < 2) return msg('Select the object to copy, then Shift-click the path to copy it along');
+  const name = u => `${u.list.length > 1 ? `Group of ${u.list.length}` : (u.list[0].name || TYPE_LABEL[u.list[0].type])} — ${r3(u.b.maxX - u.b.minX)} × ${r3(u.b.maxY - u.b.minY)} mm`;
+  const P = settings.alongPath || { count: 10, spacing: 0, rotate: true, select: true };
+  const v = await formDialog('Copy along path', [
+    { key: 'path', label: 'Path to follow', type: 'select', value: String(us.indexOf(lastUnit(us))), options: us.map((u, i) => [String(i), name(u)]) },
+    { key: 'count', label: 'Number of copies', type: 'number', value: P.count, min: 1, step: 1 },
+    { key: 'spacing', label: '…or one copy every (mm, 0 = use the number)', type: 'number', value: P.spacing, min: 0 },
+    { key: 'rotate', label: 'Rotate copies to follow the path', type: 'check', value: P.rotate },
+    { key: 'select', label: 'Select the copies afterwards', type: 'check', value: P.select },
+    { key: 'n', type: 'note', label: 'Copies are centred on the path. On a closed path they go all the way round; on an open path from one end to the other. The originals stay where they are.' },
+  ], { ok: 'Copy' });
+  if (!v) return;
+  const count = clamp(Math.round(v.count) || 1, 1, 5000), spacing = Math.max(0, v.spacing || 0);
+  settings.alongPath = { count, spacing, rotate: v.rotate, select: v.select }; saveSettings();
+  const path = us[+v.path] || lastUnit(us), src = us.filter(u => u !== path).flatMap(u => u.list);
+  const polys = path.list.filter(o => o.type !== 'image').flatMap(o => worldPolys(o)).filter(p => p.pts.length >= 2);
+  if (!polys.length) return msg('That object has no outline to follow', 'err');
+  const len = p => p.pts.reduce((s, q, i) => i ? s + Math.hypot(q[0] - p.pts[i - 1][0], q[1] - p.pts[i - 1][1]) : 0, 0) + (p.closed ? Math.hypot(p.pts[0][0] - p.pts[p.pts.length - 1][0], p.pts[0][1] - p.pts[p.pts.length - 1][1]) : 0);
+  const longest = polys.reduce((a, p) => len(p) > len(a) ? p : a);
+  const spots = samplePath(longest.pts, longest.closed, count, spacing);
+  if (!spots.length) return msg('The path is too short', 'err');
+  if (spots.length > 5000) return msg(`That would make ${spots.length.toLocaleString()} copies — use a larger spacing`, 'err');
+  const b = boundsOf(src), cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
+  edit(() => {
+    const made = [];
+    for (const s of spots) {
+      const copies = copyObjs(src, s.x - cx, s.y - cy);
+      if (v.rotate) applyRotate(origOf(copies), s.angle, s.x, s.y);
+      made.push(...copies);
+    }
+    if (v.select) S.sel = new Set(made.map(o => o.id));
+  });
+  msg(`Made ${plural(spots.length, 'copy', 'copies')} along the path`, 'ok');
+}
+// Rubber-band outline: the shortest outline around the selection (convex hull), as a new shape on the active layer.
+function rubberBand() {
+  const objs = selected(); if (!objs.length) return msg('Select the shapes to wrap');
+  const h = hull(objs.flatMap(o => worldPolys(o).flatMap(p => p.pts)));
+  if (h.length < 3) return msg('The selection needs some width and height', 'err');
+  edit(() => {
+    const L = activeLayer().mode === 'image' ? (S.layers.find(l => l.mode !== 'image') || layerForColor(PALETTE[1])) : activeLayer();
+    S.sel = new Set([pathFromWorld([{ closed: true, pts: h }], { layer: L.id, name: 'Rubber-band outline' }).id]);
+  });
+  msg('Added a rubber-band outline around the selection', 'ok');
+}
+// Convert to bitmap: render the selected vector shapes as a black-and-white picture on the image layer.
+async function toBitmapDialog() {
+  const objs = selected().filter(o => o.type !== 'image');
+  if (!objs.length) return msg('Select the vector shapes to turn into a bitmap');
+  if (blockLocked(objs, 'converted')) return;
+  const IL = S.layers.find(l => l.mode === 'image');
+  const B = settings.bitmap || { dpi: IL ? Math.round(25.4 / IL.interval) : 254, render: 'cut', stroke: 0.2 };
+  const v = await formDialog('Convert to bitmap', [
+    { key: 'dpi', label: 'Resolution (DPI)', type: 'number', value: B.dpi, min: 25, max: 1200, step: 1 },
+    { key: 'render', label: 'Render', type: 'select', value: B.render, options: [['cut', 'Use cut settings (Fill layers filled, others as outlines)'], ['fill', 'Fill all closed shapes'], ['outline', 'Outlines only']] },
+    { key: 'stroke', label: 'Outline thickness (mm)', type: 'number', value: B.stroke, min: 0.01, step: 0.05 },
+    { key: 'n', type: 'note', label: 'The shapes are replaced by a picture on the image layer (Undo brings them back). It engraves with that layer\'s dither and line interval.' },
+  ], { ok: 'Convert', wide: true });
+  if (!v) return;
+  const dpi = clamp(Math.round(v.dpi) || 254, 25, 1200), stroke = Math.max(0.01, v.stroke || 0.2);
+  settings.bitmap = { dpi, render: v.render, stroke }; saveSettings();
+  const b = boundsOf(objs), k = dpi / 25.4, x0 = b.minX - stroke, y0 = b.minY - stroke;
+  let cvs;
+  try { cvs = makeCanvas(Math.ceil((b.maxX - b.minX + 2 * stroke) * k), Math.ceil((b.maxY - b.minY + 2 * stroke) * k)); } catch (e) { return msg(e.message, 'err'); }
+  const g = cvs.getContext('2d');
+  g.fillStyle = '#fff'; g.fillRect(0, 0, cvs.width, cvs.height);
+  g.setTransform(k, 0, 0, k, -x0 * k, -y0 * k);
+  g.fillStyle = g.strokeStyle = '#000'; g.lineWidth = stroke; g.lineJoin = g.lineCap = 'round';
+  for (const o of objs) {
+    const closed = new Path2D(), open = new Path2D();
+    for (const q of worldPolys(o)) {
+      if (q.pts.length < 2) continue;
+      const P = q.closed && q.pts.length >= 3 ? closed : open;
+      P.moveTo(q.pts[0][0], q.pts[0][1]);
+      for (let i = 1; i < q.pts.length; i++) P.lineTo(q.pts[i][0], q.pts[i][1]);
+      if (P === closed) P.closePath();
+    }
+    const fill = v.render === 'fill' || (v.render === 'cut' && isFillLayer(layerById(o.layer)));
+    if (fill) g.fill(closed, 'evenodd'); else g.stroke(closed);
+    g.stroke(open);
+  }
+  const src = cvs.toDataURL('image/png'), key = uid(), w = cvs.width / k, h = cvs.height / k;
+  try { await loadImage(key, src); } catch { return msg('Could not create the bitmap', 'err'); }
+  let layerName = '';
+  edit(() => {
+    // the first Image layer, else a new one (a layer that holds cut/engrave shapes is never switched to Image mode)
+    const hasShapes = col => S.objects.some(o => o.type !== 'image' && !objs.includes(o) && layerById(o.layer)?.color === col);
+    const L = S.layers.find(l => l.mode === 'image')
+      || layerForColor(hasShapes(PALETTE[5]) ? PALETTE.find(col => !S.layers.some(l => l.color === col)) || PALETTE[5] : PALETTE[5], 'image');
+    L.mode = 'image'; layerName = L.name;
+    const ids = new Set(objs.map(o => o.id));
+    S.objects = S.objects.filter(o => !ids.has(o.id));
+    const o = addObject({ type: 'image', name: 'Bitmap', src, imgKey: key, w, h, brightness: 100, contrast: 100, gamma: 1, invert: false, layer: L.id,
+      tf: { x: x0 + w / 2, y: y0 + h / 2, sx: 1, sy: 1, r: 0 } });
+    S.sel = new Set([o.id]);
+  });
+  msg(`Converted to a ${cvs.width} × ${cvs.height} px bitmap (${dpi} DPI) on ${layerName}`, 'ok');
+}
+async function closeTolDialog() {
+  const objs = selected().filter(o => o.type === 'path' && o.polys.some(p => !p.closed && p.pts.length >= 3));
+  if (!objs.length) return msg('No open paths selected');
+  if (blockLocked(objs, 'changed')) return;
+  const C = settings.closeTol || { tol: 0.5, mode: 'join' };
+  const v = await formDialog('Close paths with tolerance', [
+    { key: 'tol', label: 'Close when the two ends are within (mm)', type: 'number', value: C.tol, min: 0 },
+    { key: 'mode', label: 'How', type: 'select', value: C.mode, options: [['join', 'Join the ends with a line'], ['move', 'Move the ends together']] },
+  ], { ok: 'Close', wide: true });
+  if (!v || !(v.tol >= 0)) return;
+  settings.closeTol = { tol: v.tol, mode: v.mode }; saveSettings();
+  let n = 0;
+  const results = objs.map(o => [o, closeWithin(o.polys, v.tol, v.mode, worldPolys(o))]).filter(([, r]) => r.count);
+  if (!results.length) return msg(`No open paths have ends within ${v.tol} mm`);
+  edit(() => results.forEach(([o, r]) => { o.polys = r.polys; n += r.count; }));
+  msg(`Closed ${plural(n, 'path', 'paths')}`, 'ok');
+}
+async function optimizeDialog() {
+  const objs = selected().filter(o => o.type === 'path');
+  if (!objs.length) return msg('Select paths to optimize (convert shapes or text to paths first)');
+  if (blockLocked(objs, 'changed')) return;
+  const v = await formDialog('Optimize selected shapes', [
+    { key: 'tol', label: 'Tolerance (mm)', type: 'number', value: settings.optTol ?? 0.02, min: 0.001, step: 0.005 },
+    { key: 'n', type: 'note', label: 'Removes repeated points and points that change the outline by less than the tolerance. Fewer points means smaller files and smoother, faster motion. BeamForge works in straight segments, so curves stay as fine segments.' },
+  ], { ok: 'Optimize' });
+  if (!v || !(v.tol > 0)) return;
+  settings.optTol = v.tol; saveSettings();
+  const count = o => o.polys.reduce((a, p) => a + p.pts.length, 0);
+  const before = objs.reduce((a, o) => a + count(o), 0);
+  edit(() => objs.forEach(o => {
+    const s = Math.sqrt(Math.abs(o.tf.sx * o.tf.sy)) || 1; // tolerance in the path's own units
+    const r = optimizePolys(o.polys, v.tol / s);
+    if (r.length) o.polys = r;
+  }));
+  const after = objs.reduce((a, o) => a + count(o), 0);
+  msg(`Optimized: ${before.toLocaleString()} → ${after.toLocaleString()} points`, 'ok');
+}
+// Delete duplicates: identical shapes stacked exactly on top of each other, across the whole design (as LightBurn).
+// Only shapes on the same layer count (the same outline on two layers, e.g. engrave + cut, is usually deliberate);
+// grouped shapes are skipped and a locked copy is always the one kept.
+function deleteDuplicates() {
+  const key = o => `${o.layer}|${o.type === 'image' ? `img:${o.src.length}:${o.src.slice(-48)}|` : ''}${polysKey(worldPolys(o))}`;
+  const seen = new Set(), drop = new Set();
+  for (const o of [...S.objects.filter(x => x.locked), ...S.objects.filter(x => !x.locked)]) {
+    if (o.group) continue;
+    const k = key(o);
+    if (seen.has(k)) { if (!o.locked) drop.add(o.id); } else seen.add(k);
+  }
+  if (!drop.size) return msg('No duplicate shapes found');
+  edit(() => { S.objects = S.objects.filter(o => !drop.has(o.id)); for (const id of drop) S.sel.delete(id); });
+  msg(`Deleted ${plural(drop.size, 'duplicate shape', 'duplicate shapes')}`, 'ok');
+}
+// Replace image: a new picture in the same place. Fit keeps it inside the old box; otherwise the width stays.
+let replaceTarget = null;
+function replaceImage(fit) {
+  const im = selected().filter(o => o.type === 'image');
+  if (im.length !== 1) return msg('Select one image to replace');
+  if (blockLocked(im, 'changed')) return;
+  replaceTarget = { id: im[0].id, fit };
+  $('#file-replace').click();
+}
+$('#file-replace').addEventListener('change', async e => {
+  const f = e.target.files[0], t = replaceTarget; e.target.value = ''; replaceTarget = null;
+  const o = t && S.objects.find(x => x.id === t.id);
+  if (!f || !o) return;
+  const ext = f.name.split('.').pop().toLowerCase();
+  if (!(f.type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp'].includes(ext))) return msg(`${f.name} is not a picture (PNG, JPG, BMP, GIF or WebP)`, 'err');
+  try {
+    const src = await readFile(f, 'url'), key = uid(), img = await loadImage(key, src);
+    const ar = img.naturalWidth / img.naturalHeight || 1;
+    edit(() => {
+      let w = o.w, h = o.w / ar;
+      if (t.fit && h > o.h) { h = o.h; w = o.h * ar; }
+      Object.assign(o, { src, imgKey: key, w, h, name: f.name });
+    });
+    msg(`Replaced the image with ${f.name}`, 'ok');
+  } catch (err) { msg(`${f.name}: ${err.message}`, 'err'); }
+});
 
 // ================================================================ import
 // Note: the file inputs deliberately have no `accept` filter. On KDE/GTK desktops Firefox's filtered file dialog can
@@ -1990,7 +3247,14 @@ function renderLayers() {
     const out = chkInput(L.output, v => edit(() => { L.output = v; }));
     out.title = 'Output this layer';
     out.addEventListener('click', ev => ev.stopPropagation());
-    const row = el('div', { class: `layer-row${L.id === cur.id ? ' active' : ''}${L.output ? '' : ' off'}`, title: 'Click to edit · new shapes go on the active layer' },
+    const hidden = L.show === false;
+    const eye = el('button', {
+      class: 'eye' + (hidden ? ' off' : ''), 'aria-pressed': String(!hidden), 'aria-label': hidden ? 'Show layer' : 'Hide layer',
+      title: hidden ? 'Hidden on the canvas: click to show it (it still burns while Output is on)' : 'Hide on the canvas (it still burns while Output is on)',
+      onclick: ev => { ev.stopPropagation(); edit(() => setLayerShown(L, hidden)); },
+    });
+    eye.innerHTML = `<svg viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/>${hidden ? '<path d="M4 4l16 16"/>' : '<circle cx="12" cy="12" r="3"/>'}</svg>`;
+    const row = el('div', { class: `layer-row${L.id === cur.id ? ' active' : ''}${L.output ? '' : ' off'}${hidden ? ' hid' : ''}`, title: 'Click to edit · Shift+click selects its shapes · right-click for more' },
       el('span', { class: 'sw', style: `background:${L.color}` }),
       el('span', { class: 'nm' }, `${L.name} `, el('span', { class: 'muted small' }, `· ${counts.get(L.id) || 0}`)),
       el('span', { class: 'meta' }, isCnc(dev())
@@ -1999,8 +3263,17 @@ function renderLayers() {
       el('span', { class: 'ord' },
         el('button', { title: 'Move up (runs earlier)', disabled: i === 0, onclick: ev => { ev.stopPropagation(); edit(() => { S.layers.splice(i - 1, 0, S.layers.splice(i, 1)[0]); }); } }, '▲'),
         el('button', { title: 'Move down (runs later)', disabled: i === S.layers.length - 1, onclick: ev => { ev.stopPropagation(); edit(() => { S.layers.splice(i + 1, 0, S.layers.splice(i, 1)[0]); }); } }, '▼')),
-      out);
-    row.addEventListener('click', () => { S.activeLayer = L.id; refreshPanels(); });
+      eye, out);
+    row.addEventListener('click', ev => {
+      if (ev.shiftKey) { act('sel-layer', { layerId: L.id }); return; } // LightBurn: Shift+click selects the layer's shapes
+      S.activeLayer = L.id; refreshPanels();
+    });
+    // Shift+right-click flashes the layer (on the button press: Firefox keeps Shift+right-click for its own menu)
+    row.addEventListener('pointerdown', ev => { if (ev.button === 2 && ev.shiftKey) flashLayer(L.id); });
+    row.addEventListener('contextmenu', ev => {
+      ev.preventDefault();
+      if (!ev.shiftKey) openMenu(layerMenu(L), ev.clientX, ev.clientY, menuOpts());
+    });
     return row;
   }));
 
@@ -2125,6 +3398,16 @@ function renderShape() {
   const objs = selected();
   if (!objs.length) { f.replaceChildren(el('p', { class: 'muted' }, 'Select a shape to edit its size, position and properties.')); return; }
   const d = dev(), b = boundsOf(objs);
+  const layerField = () => field('Layer', selInput(objs.every(o => o.layer === objs[0].layer) ? objs[0].layer : '', S.layers.map(l => [l.id, `${l.name} (${MODE_LABEL[l.mode]})`]), v => edit(() => objs.forEach(o => { o.layer = v; }))));
+  if (objs.some(o => o.locked)) { // locked: only the layer can change
+    f.replaceChildren(
+      el('div', { class: 'lockbar' }, el('span', {}, el('b', {}, 'Locked'), ' — can be selected and copied, but not moved, resized, changed or deleted.'),
+        el('button', { onclick: () => act('unlock') }, 'Unlock')),
+      el('h3', {}, objs.length > 1 ? `${objs.length} objects` : (objs[0].name || TYPE_LABEL[objs[0].type])),
+      el('p', { class: 'muted small' }, `${r3(b.maxX - b.minX)} × ${r3(b.maxY - b.minY)} mm`),
+      layerField());
+    return;
+  }
   const right = d.origin === 'tr' || d.origin === 'br', front = d.origin === 'bl' || d.origin === 'br';
   const W = b.maxX - b.minX, H = b.maxY - b.minY;
   const c1 = toMachine(d, b.minX, b.minY), c2 = toMachine(d, b.maxX, b.maxY);
@@ -2149,8 +3432,7 @@ function renderShape() {
       field('H', numInput(r3(H), v => resize(lockBox.checked ? v * W / (H || 1) : W, v), { min: 0.01 }))),
     check('Lock aspect ratio', lockBox),
   ];
-  const sameLayer = objs.every(o => o.layer === objs[0].layer);
-  kids.push(field('Layer', selInput(sameLayer ? objs[0].layer : '', S.layers.map(l => [l.id, `${l.name} (${MODE_LABEL[l.mode]})`]), v => edit(() => objs.forEach(o => { o.layer = v; })))));
+  kids.push(layerField());
 
   if (objs.length === 1) {
     const o = objs[0];
@@ -2452,12 +3734,14 @@ $('#j-start-btn').addEventListener('click', guard(async () => {
   const job = buildJob();
   const dry = $('#j-dry').checked;
   const ruidaNote = isRuida() && !dry ? ' Ruida support is new and has not been tested on a real machine yet — if you have not done so, cancel and do a Dry run first, then a small test at low power.' : '';
+  const only = jobOpts().selectedIds, hiddenOut = S.layers.filter(L => L.output && L.show === false && S.objects.some(o => o.layer === L.id && (!only || only.has(o.id))));
+  const hiddenNote = hiddenOut.length ? ` Hidden layer${hiddenOut.length > 1 ? 's' : ''} ${hiddenOut.map(L => `“${L.name}”`).join(', ')} will run too (Output is on).` : '';
   const cnc = isCnc(dev());
   const safety = cnc
     ? (dry ? ' Air cut: the spindle stays off and every move is lifted above the material.' : ' Check: material clamped, bit tight, Z0 set on the material top, spindle on (if it is not controlled by the machine), eye and ear protection on. Keep a hand near the emergency stop.')
     : (dry ? ' The laser will not fire; the head just traces the job.' : ' Make sure the material is in place, the lid is closed and you are wearing laser-safe eyewear. Never leave a running laser unattended.');
   const ok = await confirmDialog(dry ? (cnc ? 'Start AIR CUT (spindle off)?' : 'Start DRY RUN (laser off)?') : 'Start job?',
-    `${dev().name}: ${job.stats.lines.toLocaleString()} ${isRuida() ? 'moves' : 'lines'} · estimated ${fmtTime(job.stats.time)}.${safety}${ruidaNote}`, dry ? (cnc ? 'Start air cut' : 'Start dry run') : 'Start');
+    `${dev().name}: ${job.stats.lines.toLocaleString()} ${isRuida() ? 'moves' : 'lines'} · estimated ${fmtTime(job.stats.time)}.${hiddenNote}${safety}${ruidaNote}`, dry ? (cnc ? 'Start air cut' : 'Start dry run') : 'Start');
   if (!ok) return;
   if (isRuida()) await machine.ruidaJob(job.ruida); else await machine.job(job.gcode);
   if (dry) { log('Dry run started (laser off)', 'sys'); return; }
@@ -2497,7 +3781,8 @@ $$('[data-cmd]').forEach(b => b.addEventListener('click', guard(() => isRuida() 
 $('#con-clear').addEventListener('click', () => conLog.replaceChildren());
 
 // Small debugging handle for the browser console.
-window.beamforge = { S, settings, dev, machine, traceDialog, selectDevice, buildJob, addObject, edit, importSvg, importImage, importPlt, act, setTool, makeLayer, layerForColor, PALETTE, selectionChanged, ACTIONS };
+window.beamforge = { S, settings, dev, machine, traceDialog, selectDevice, buildJob, addObject, edit, importSvg, importImage, importPlt, act, setTool, makeLayer, layerForColor, PALETTE, selectionChanged, ACTIONS,
+  toScreen, toWorld, openCanvasMenu, isMenuOpen, closeMenu, worldPolys, objBounds, refreshPanels };
 
 // ================================================================ boot
 (async function boot() {

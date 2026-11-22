@@ -1,5 +1,7 @@
 // Shape operations built on the Clipper polygon library (vendor/clipper.js, Boost licence):
-// offsetting, booleans, concentric offset fill — plus tabs, perforation and convex hull.
+// offsetting, booleans, concentric offset fill — plus tabs, perforation, convex hull, path clean-up,
+// docking and node editing helpers.
+import { simplify, distToSegment, pointInPoly, boundsOfPolys } from './geom.js';
 
 const CL = () => {
   const c = globalThis.ClipperLib;
@@ -212,4 +214,165 @@ export function reflectTf(tf, deg, cx, cy) {
   const t = 2 * deg * Math.PI / 180, c = Math.cos(t), s = Math.sin(t);
   const dx = tf.x - cx, dy = tf.y - cy;
   return { ...tf, x: cx + c * dx + s * dy, y: cy + s * dx - c * dy, sy: -tf.sy, r: (((2 * deg - tf.r) % 360) + 360) % 360 };
+}
+
+// ---------------------------------------------------------------- path clean-up (Edit menu)
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+// Close open sub-paths whose two ends are within `tol` mm. mode 'join' closes them with a short straight line,
+// 'move' moves both ends to their midpoint. `measure` (same structure, e.g. in world mm) decides which ends are
+// close enough; the edit itself is applied to `polys`.
+export function closeWithin(polys, tol, mode = 'join', measure = polys) {
+  let count = 0;
+  const out = polys.map((p, i) => {
+    const m = measure[i] || p;
+    if (p.closed || p.pts.length < 3 || m.pts.length !== p.pts.length) return p;
+    const d = dist(m.pts[0], m.pts[m.pts.length - 1]);
+    if (d > tol) return p;
+    const pts = p.pts.slice(), a = pts[0], z = pts[pts.length - 1];
+    if (d < 1e-6) pts.pop();
+    else if (mode === 'move') { pts.pop(); pts[0] = [(a[0] + z[0]) / 2, (a[1] + z[1]) / 2]; }
+    if (pts.length < 3) return p;
+    count++;
+    return { closed: true, pts };
+  });
+  return { polys: out, count };
+}
+
+// Drop repeated points and points that change the outline by less than `tol` (Ramer–Douglas–Peucker).
+// Closed loops are split at the point farthest from the start so both halves simplify cleanly.
+export function optimizePolys(polys, tol) {
+  const out = [];
+  for (const p of polys) {
+    let pts = [];
+    for (const q of p.pts) if (!pts.length || dist(q, pts[pts.length - 1]) > 1e-6) pts.push(q);
+    if (p.closed && pts.length > 1 && dist(pts[0], pts[pts.length - 1]) <= 1e-6) pts.pop();
+    if (pts.length < 2) continue;
+    if (tol > 0 && pts.length > 2) {
+      if (p.closed) {
+        let far = 0, fd = -1;
+        for (let i = 1; i < pts.length; i++) { const d = dist(pts[i], pts[0]); if (d > fd) { fd = d; far = i; } }
+        const a = simplify(pts.slice(0, far + 1), tol), b = simplify([...pts.slice(far), pts[0]], tol);
+        let s = a.concat(b.slice(1, -1));
+        const z = s[s.length - 1];
+        // the start point can go too if it sits on a straight edge
+        if (s.length > 3 && distToSegment(s[0][0], s[0][1], z[0], z[1], s[1][0], s[1][1]) <= tol) s = s.slice(1);
+        if (s.length >= 3) pts = s;
+      } else pts = simplify(pts, tol);
+    }
+    out.push({ closed: p.closed && pts.length >= 3, pts });
+  }
+  return out;
+}
+
+// Fingerprint of an outline for finding duplicates: its points rounded to `grid` mm, ignoring where each loop
+// starts and which way it runs.
+export function polysKey(polys, grid = 0.01) {
+  return polys.filter(p => p.pts.length).map(p => {
+    const pts = p.pts.map(([x, y]) => `${Math.round(x / grid) || 0},${Math.round(y / grid) || 0}`);
+    if (p.closed && pts.length > 1 && pts[0] === pts[pts.length - 1]) pts.pop();
+    return `${p.closed ? 'c' : 'o'}${pts.length}:${pts.sort().join(' ')}`;
+  }).sort().join('|');
+}
+
+// True when every point of `inner` lies inside a closed outline of `outer` (holes in `outer` don't matter).
+export function polysInside(inner, outer, bi = boundsOfPolys(inner), bo = boundsOfPolys(outer)) {
+  const e = 1e-6;
+  if (!(bi.minX >= bo.minX - e && bi.maxX <= bo.maxX + e && bi.minY >= bo.minY - e && bi.maxY <= bo.maxY + e)) return false;
+  const rings = outer.filter(p => p.closed && p.pts.length >= 3);
+  if (!rings.length || !inner.some(p => p.pts.length)) return false;
+  for (const p of inner) {
+    const step = Math.max(1, Math.floor(p.pts.length / 400)); // sample long outlines
+    for (let i = 0; i < p.pts.length; i += step) {
+      const [x, y] = p.pts[i];
+      if (!rings.some(r => pointInPoly(x, y, r.pts))) return false;
+    }
+  }
+  return true;
+}
+
+// Evenly spaced points along a polyline, with the direction of travel there in degrees (0 = +X; positive turns
+// clockwise on screen, like object rotation). Closed: `count` points around the loop; open: `count` points from one
+// end to the other. With spacing > 0: one point every `spacing` mm instead.
+export function samplePath(pts, closed, count, spacing = 0) {
+  const ring = closed ? [...pts, pts[0]] : pts;
+  if (ring.length < 2) return [];
+  const cum = cumLengths(ring), L = cum[cum.length - 1];
+  if (!(L > 1e-9)) return [];
+  const ss = [];
+  if (spacing > 0) {
+    const n = Math.min(100000, Math.floor(L / spacing + 1e-9) + (closed ? 0 : 1));
+    for (let i = 0; i < n; i++) ss.push(i * spacing);
+  } else {
+    const n = Math.max(1, Math.round(count));
+    for (let i = 0; i < n; i++) ss.push(closed ? L * i / n : n > 1 ? L * i / (n - 1) : 0);
+  }
+  return ss.map(s => {
+    let i = 1;
+    while (i < ring.length - 1 && cum[i] <= s) i++; // at a corner, face along the next edge
+    while (i < ring.length - 1 && cum[i] - cum[i - 1] < 1e-9) i++; // skip zero-length segments
+    const a = ring[i - 1], b = ring[i], [x, y] = pointAt(ring, cum, s);
+    return { x, y, angle: Math.atan2(b[1] - a[1], b[0] - a[0]) * 180 / Math.PI };
+  });
+}
+
+// Dock: slide each box in `dir` ('left' | 'right' | 'up' | 'down'; up = -Y) until it touches an obstacle box it
+// overlaps across the direction of travel, or the edge of `area`, leaving `pad` mm. Obstacles it already overlaps are
+// ignored (so a shape inside a frame slides out through the frame's inner edge). Boxes nearest the target edge go
+// first and then block the others. Returns [dx, dy] for each box; nothing ever moves backwards.
+export function dockBoxes(boxes, obstacles, area, dir, pad = 0) {
+  const horiz = dir === 'left' || dir === 'right', neg = dir === 'left' || dir === 'up';
+  const lo = horiz ? 'minX' : 'minY', hi = horiz ? 'maxX' : 'maxY';
+  const plo = horiz ? 'minY' : 'minX', phi = horiz ? 'maxY' : 'maxX';
+  const e = 1e-7, obs = obstacles.slice(), out = new Array(boxes.length);
+  const order = boxes.map((_, i) => i).sort((a, c) => (neg ? boxes[a][lo] - boxes[c][lo] : boxes[c][hi] - boxes[a][hi]));
+  for (const i of order) {
+    const b = boxes[i];
+    let travel = neg ? b[lo] - (area[lo] + pad) : area[hi] - pad - b[hi];
+    for (const o of obs) {
+      if (o[plo] >= b[phi] - e || o[phi] <= b[plo] + e) continue; // not in the way
+      const gap = neg ? b[lo] - o[hi] : o[lo] - b[hi];
+      if (gap < -e) continue; // already overlapping, or behind
+      travel = Math.min(travel, gap - pad);
+    }
+    const d = neg ? -Math.max(0, travel) : Math.max(0, travel);
+    out[i] = horiz ? [d, 0] : [0, d];
+    obs.push({ ...b, [lo]: b[lo] + d, [hi]: b[hi] + d });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- node editing
+// Break sub-path pi at vertex vi: a closed loop opens there (that vertex becomes both ends); an open path splits in
+// two. Returns the new sub-path list, or null if the vertex is already an end.
+export function breakAt(polys, pi, vi) {
+  const p = polys[pi];
+  if (!p) return null;
+  const n = p.pts.length;
+  let parts;
+  if (p.closed) {
+    if (n < 2) return null;
+    parts = [{ closed: false, pts: [...p.pts.slice(vi), ...p.pts.slice(0, vi), p.pts[vi]] }];
+  } else {
+    if (vi <= 0 || vi >= n - 1) return null;
+    parts = [{ closed: false, pts: p.pts.slice(0, vi + 1) }, { closed: false, pts: p.pts.slice(vi) }];
+  }
+  return [...polys.slice(0, pi), ...parts, ...polys.slice(pi + 1)];
+}
+// Delete the line from vertex i to the next one (on a closed loop i = n - 1 is the closing line). A closed loop
+// becomes an open path; an open path splits in two (pieces shorter than a line are dropped).
+export function removeSegment(polys, pi, i) {
+  const p = polys[pi];
+  if (!p) return null;
+  const n = p.pts.length;
+  let parts;
+  if (p.closed) {
+    if (i < 0 || i >= n) return null;
+    const j = (i + 1) % n;
+    parts = [{ closed: false, pts: [...p.pts.slice(j), ...p.pts.slice(0, j)] }];
+  } else {
+    if (i < 0 || i >= n - 1) return null;
+    parts = [{ closed: false, pts: p.pts.slice(0, i + 1) }, { closed: false, pts: p.pts.slice(i + 1) }];
+  }
+  return [...polys.slice(0, pi), ...parts.filter(q => q.pts.length >= 2), ...polys.slice(pi + 1)];
 }

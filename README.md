@@ -71,16 +71,43 @@ Always clamp the material, check the bit is tight, wear eye and ear protection, 
 `{serial:4}`, `{date}`, `{time}`, `{year}`, `{month}`, `{day}`), node editing, measure tool, handles for
 move/scale/rotate, numeric position/size/rotation, snap to grid, undo/redo.
 
-**Trace image** (live preview) — brightness band (cutoff → threshold), sketch/edge tracing, PNG transparency;
-ignore small specks, smoothness, optimize, detail, fade preview, delete image after tracing.
+**Trace image** (live preview) — **Auto trace** looks at the picture and picks the mode, threshold and clean-up
+(dark on light or light on dark, white logos on transparent PNGs, speckled scans); then adjust anything and press Trace.
+Zoom into the preview to check the detail: scroll to zoom, drag to move around, double-click to zoom in or back out,
+or + / − / 0 and the arrow keys. The preview refines to the exact final trace in the background. Brightness band
+(cutoff → threshold), sketch/edge tracing, PNG transparency; ignore small specks, smoothness (sharp corners stay
+sharp), optimize, detail, fade preview, delete image after tracing. Outlines land on the picture's edges to within a
+fraction of a pixel, so traced parts come out the right size.
 
-**Arrange** (Arrange menu and the icon bar at the top of the Shape tab) — group/ungroup; align left/right/top/bottom/centres
-to the selection, the first-selected object or the bed; distribute by equal gaps or by centres, set exact spacing, make same
-width/height/size; mirror horizontally/vertically/both, mirror a copy, mirror across a line at any angle; centre on bed,
-rotate 90°, grid array, circular array.
+**Right-click menus** (like LightBurn's) — right-click a shape to select it and get Cut / Copy / Duplicate / Paste
+(lands where you clicked) / Paste in place / Delete, plus submenus for Select, Flip & rotate, Align, Distribute & size,
+Move, Draw order, Path tools, Boolean & offset, Array & copy, Image, Move to layer and Laser (move the laser here, set the
+user origin here). Items that can't be used right now are greyed out, and hovering one says why. Right-click empty space
+to paste, select, add text or import. In Edit nodes mode, right-click a point or line for node tools. While drawing a line,
+right-click to finish, close or undo the last point. In the Cuts list, right-click a layer to switch its output or
+visibility, select or flash its shapes, or sort cuts last (Shift+right-click flashes it). The Menu key or Shift+F10 opens
+the menu from the keyboard.
 
-**Shape tools** — weld, subtract, intersect, exclude, offset (round/sharp/bevel), fillet (round) and chamfer corners, convert to path, break apart,
-auto-join, close paths.
+**Arrange** (Arrange menu, right-click menu and the icon bar at the top of the Shape tab) — group/ungroup, auto-group
+(each outer shape with the shapes inside it), lock/unlock (locked shapes can be selected and copied but not moved,
+changed or deleted); align left/right/top/bottom/centres to the selection, the first-selected object or the bed;
+distribute by equal gaps or by centres, move together, set exact spacing, make same width/height/size; mirror
+horizontally/vertically/both, mirror a copy, mirror across a line at any angle; rotate 90°/180°/any angle; move to the
+bed centre, corners or edges, to the laser position or by a distance; dock against other shapes or the bed edge; draw
+order (front/forward/backward/back); grid array, circular array, copy along a path, rubber-band outline.
+
+**Shape tools** — weld, subtract, intersect, exclude, offset (round/sharp/bevel), fillet (round) and chamfer corners, convert to path,
+convert to bitmap, break apart, auto-join, close paths (also with a gap tolerance), optimize (fewer points), delete
+duplicates; select open shapes, open shapes on fill layers, shapes inside the selection, or shapes smaller than the
+selection; replace an image keeping its place. Layers can be hidden (eye button) — hidden layers still burn while their
+Output is on, and the Start dialog says so.
+
+**Shortcuts** (LightBurn's where they don't clash with the one-letter tool keys) — Ctrl+Shift+I invert selection,
+Alt+V paste in place, Ctrl+U ungroup, Ctrl+Shift+C convert to path, Ctrl+Shift+B convert to bitmap, Alt+C close path,
+Alt+J auto-join, Alt+Shift+O optimize, Alt+D delete duplicates, Alt+B break apart, Alt+O offset, Alt+T trace,
+Alt+I adjust image, Ctrl+Shift+H / V flip, Ctrl+Shift+M mirror across a line, Ctrl+Shift+arrows align,
+Alt+Shift+H / V move together, PgUp / PgDn draw order (Ctrl for front/back), Ctrl+Shift+A zoom to selection, + / − zoom.
+Edit nodes: D delete point, B break, I insert point under the pointer. Drawing a line: Backspace removes the last point.
 
 **Import / export** — SVG (including pictures embedded in SVG files, ready to trace), DXF, HPGL/PLT, PNG/JPG/BMP/GIF/WebP; export SVG, DXF, G-code, Ruida RD files.
 
@@ -121,9 +148,11 @@ node server.js                 # BEAMFORGE_PORT=8787 by default
 - `public/js/ruida.js` — Ruida command encoding, swizzling, packets, RD job encoder
 - `public/js/devices.js` — controller profiles, coordinate mapping, rotary, controller commands
 - `public/js/gcode.js` — job generation (G-code and Ruida), path ordering, kerf/tabs/perforation, fills, images
-- `public/js/ops.js` — offsets, booleans, concentric fill, tabs, dashes, hull, auto-join
+- `public/js/ops.js` — offsets, booleans, concentric fill, tabs, dashes, hull, auto-join, path clean-up, dock, node edits
+- `public/js/menu.js` — pop-up menus (menu bar and right-click), submenus, keyboard control
 - `public/js/geom.js` — matrices, shapes, SVG path / DXF parsing, simplification
-- `public/js/raster.js` — contour tracing, image trace, text outlines, dithering, gamma
+- `public/js/raster.js` — contour tracing, image trace and Auto trace, text outlines, dithering, image adjustments
+- `public/js/trace-worker.js` — full-detail tracing off the main thread for the Trace image dialog
 - `public/js/shapes.js`, `public/js/app.js`, `public/js/machine.js` — objects, editor UI, server client
 
 ## Credits

@@ -10,107 +10,13 @@
 <body>
 <header class="topbar">
   <div class="brand"><img src="icon.svg" alt="" class="logo"> BeamForge</div>
-  <nav class="menubar">
-    <div class="menu"><button class="menu-btn">File</button>
-      <div class="menu-pop">
-        <button data-act="new">New project</button>
-        <button data-act="open">Open project…<kbd>Ctrl+O</kbd></button>
-        <button data-act="save">Save project<kbd>Ctrl+S</kbd></button>
-        <hr>
-        <button data-act="import">Import SVG / DXF / PLT / image…<kbd>Ctrl+I</kbd></button>
-        <button data-act="export-svg">Export SVG…</button>
-        <button data-act="export-dxf">Export DXF…</button>
-        <hr>
-        <button data-act="export">Save G-code / Ruida RD file…<kbd>Ctrl+E</kbd></button>
-        <button data-act="run-file">Run a G-code file on the laser…</button>
-      </div>
-    </div>
-    <div class="menu"><button class="menu-btn">Edit</button>
-      <div class="menu-pop">
-        <button data-act="undo">Undo<kbd>Ctrl+Z</kbd></button>
-        <button data-act="redo">Redo<kbd>Ctrl+Y</kbd></button>
-        <hr>
-        <button data-act="cut">Cut<kbd>Ctrl+X</kbd></button>
-        <button data-act="copy">Copy<kbd>Ctrl+C</kbd></button>
-        <button data-act="paste">Paste<kbd>Ctrl+V</kbd></button>
-        <button data-act="dup">Duplicate<kbd>Ctrl+D</kbd></button>
-        <button data-act="del">Delete<kbd>Del</kbd></button>
-        <button data-act="select-all">Select all<kbd>Ctrl+A</kbd></button>
-        <hr>
-        <button data-act="topath">Convert to path</button>
-        <button data-act="break">Break apart</button>
-        <button data-act="join">Auto-join open paths…</button>
-        <button data-act="close-paths">Close open paths</button>
-        <hr>
-        <button data-act="settings">Preferences…</button>
-      </div>
-    </div>
-    <div class="menu"><button class="menu-btn">Arrange</button>
-      <div class="menu-pop">
-        <button data-act="group">Group<kbd>Ctrl+G</kbd></button>
-        <button data-act="ungroup">Ungroup<kbd>Ctrl+Shift+G</kbd></button>
-        <hr>
-        <button data-act="al-l">Align left</button>
-        <button data-act="al-hc">Align centres horizontally</button>
-        <button data-act="al-r">Align right</button>
-        <button data-act="al-t">Align top</button>
-        <button data-act="al-vc">Align centres vertically</button>
-        <button data-act="al-b">Align bottom</button>
-        <button data-act="dist-h">Distribute horizontally (equal gaps)</button>
-        <button data-act="dist-v">Distribute vertically (equal gaps)</button>
-        <button data-act="dist-hc">Distribute centres horizontally</button>
-        <button data-act="dist-vc">Distribute centres vertically</button>
-        <button data-act="spacing">Set spacing…</button>
-        <button data-act="same-w">Make same width</button>
-        <button data-act="same-h">Make same height</button>
-        <button data-act="same-size">Make same size</button>
-        <button data-act="center">Centre on bed</button>
-        <hr>
-        <button data-act="mirror-h">Mirror horizontally</button>
-        <button data-act="mirror-v">Mirror vertically</button>
-        <button data-act="mirror-both">Mirror both (flip 180°)</button>
-        <button data-act="mirror-copy-h">Mirror copy to the right</button>
-        <button data-act="mirror-copy-v">Mirror copy below</button>
-        <button data-act="mirror-line">Mirror across a line…</button>
-        <button data-act="rot-cw">Rotate 90° clockwise</button>
-        <button data-act="rot-ccw">Rotate 90° counter-clockwise</button>
-        <hr>
-        <button data-act="array">Grid array…</button>
-        <button data-act="circ-array">Circular array…</button>
-      </div>
-    </div>
-    <div class="menu"><button class="menu-btn">Tools</button>
-      <div class="menu-pop">
-        <button data-act="weld">Weld (union)</button>
-        <button data-act="subtract">Boolean subtract</button>
-        <button data-act="intersect">Boolean intersect</button>
-        <button data-act="xor">Boolean exclude (XOR)</button>
-        <button data-act="offset">Offset shapes…</button>
-        <button data-act="fillet">Fillet (round) corners…</button>
-        <button data-act="chamfer">Chamfer corners…</button>
-        <hr>
-        <button data-act="trace">Trace image…</button>
-        <button data-act="qr">QR code…</button>
-        <button data-act="csv">Variable text data (CSV merge)…</button>
-        <button data-act="pack">Pack onto the bed…</button>
-        <button data-act="tool-node">Edit nodes<kbd>N</kbd></button>
-        <button data-act="tool-measure">Measure<kbd>M</kbd></button>
-      </div>
-    </div>
-    <div class="menu"><button class="menu-btn">Laser</button>
-      <div class="menu-pop">
-        <button data-act="devices">Devices…</button>
-        <button data-act="machine-settings">Machine settings…</button>
-        <button data-act="rotary">Rotary setup…</button>
-        <button data-act="macros">Edit macros…</button>
-        <hr>
-        <button data-act="library">Material library…</button>
-        <button data-act="material-test">Material test…</button>
-        <button data-act="print-cut">Print and cut…</button>
-        <button data-act="goto-sel">Move laser to selection</button>
-        <button data-act="user-origin">User origin…</button>
-      </div>
-    </div>
+  <nav class="menubar" aria-label="Menu">
+    <button class="menu-btn" data-menu="file" aria-haspopup="menu">File</button>
+    <button class="menu-btn" data-menu="edit" aria-haspopup="menu">Edit</button>
+    <button class="menu-btn" data-menu="arrange" aria-haspopup="menu">Arrange</button>
+    <button class="menu-btn" data-menu="tools" aria-haspopup="menu">Tools</button>
+    <button class="menu-btn" data-menu="laser" aria-haspopup="menu">Laser</button>
+    <button class="menu-btn" data-menu="view" aria-haspopup="menu">View</button>
   </nav>
   <div class="group">
     <button data-act="import" title="Import (Ctrl+I)">Import</button>
@@ -255,6 +161,7 @@
 <input type="file" id="file-open" hidden>
 <input type="file" id="file-gcode" hidden>
 <input type="file" id="file-lib" hidden>
+<input type="file" id="file-replace" hidden>
 <dialog id="dlg"><form method="dialog" id="dlg-form"></form></dialog>
 
 <script src="vendor/clipper.js"></script>
