@@ -119,5 +119,50 @@ const sq = (x, y, s) => [[x, y], [x + s, y], [x + s, y + s], [x, y + s]];
   ok('delete segment: other sub-paths kept', keep.length === 1 && keep[0].closed);
 }
 
+// --- trim (cut lines back to where they cross)
+{
+  ok('cross: segments crossing in the middle', near(O.segmentCross([0, 0], [10, 0], [5, -5], [5, 5]), 0.5));
+  ok('cross: a line ending on another counts', near(O.segmentCross([0, 0], [10, 0], [3, 0], [3, 5]), 0.3));
+  ok('cross: parallel lines do not', O.segmentCross([0, 0], [10, 0], [0, 1], [10, 1]) === -1);
+  ok('cross: lines that miss do not', O.segmentCross([0, 0], [10, 0], [12, -5], [12, 5]) === -1);
+  // brute-force neighbour lists: other paths' segments, plus the path's own (with their index)
+  const segsOf = (pts, closed, self) => { const out = [], n = pts.length; for (let i = 0; i < (closed ? n : n - 1); i++) { const a = pts[i], b = pts[(i + 1) % n]; out.push([a[0], a[1], b[0], b[1], self ? i : -1]); } return out; };
+  const nearAll = (pts, closed, others) => () => [...others.flatMap(o => segsOf(o.pts, o.closed, false)), ...segsOf(pts, closed, true)];
+  const line = [[0, 0], [10, 0]];
+  const cuts = O.crossingsAlong(line, false, nearAll(line, false, [{ pts: [[3, -2], [3, 2]] }, { pts: [[7, -2], [7, 2]] }]));
+  ok('crossings: found along the line', cuts.length === 2 && near(cuts[0], 3) && near(cuts[1], 7), JSON.stringify(cuts));
+  const mid = O.trimPath(line, false, cuts, 5);
+  ok('trim: the middle piece goes', !mid.whole && ptEq(mid.removed[0], [3, 0]) && ptEq(mid.removed[mid.removed.length - 1], [7, 0]) && mid.kept.length === 2, JSON.stringify(mid));
+  ok('trim: new ends are at the crossings', mid.ends.length === 2 && ptEq(mid.ends[0], [3, 0]) && ptEq(mid.ends[1], [7, 0]));
+  const end = O.trimPath(line, false, cuts, 1);
+  ok('trim: an end piece goes back to the first crossing', end.kept.length === 1 && ptEq(end.kept[0].pts[0], [3, 0]) && ptEq(end.kept[0].pts[1], [10, 0]));
+  ok('trim: nothing crossing → the whole line goes', O.trimPath(line, false, [], 5).whole);
+  // a closed square crossed by a vertical line at x = 4: the left part is cut out, the rest stays as one open path
+  const sqr = sq(0, 0, 10), cutter = { pts: [[4, -5], [4, 15]] };
+  const sc = O.crossingsAlong(sqr, true, nearAll(sqr, true, [cutter]));
+  ok('crossings: a square crossed twice', sc.length === 2, JSON.stringify(sc));
+  const left = O.trimPath(sqr, true, sc, 36); // on the left edge (from (0,10) to (0,0))
+  ok('trim: closed shape becomes one open path', !left.whole && left.kept.length === 1 && !left.kept[0].closed);
+  const kp = left.kept[0].pts;
+  ok('trim: the kept part runs round the right side', kp.length === 4 && ptEq(kp[0], [4, 0]) && ptEq(kp[3], [4, 10]) && ptEq(kp[1], [10, 0]) && ptEq(kp[2], [10, 10]), JSON.stringify(kp));
+  ok('trim: a loop crossed once goes completely', O.trimPath(sqr, true, [5], 20).whole);
+  // a figure-eight crosses itself
+  const eight = [[0, 0], [10, 10], [10, 0], [0, 10]];
+  const ec = O.crossingsAlong(eight, true, nearAll(eight, true, []));
+  ok('crossings: a path crossing itself', ec.length === 2, JSON.stringify(ec));
+  // two overlapping squares: trim each one's part inside the other, then join at the crossings → one outline
+  const A = sq(0, 0, 10), B = sq(5, 5, 10);
+  const ta = O.trimPath(A, true, O.crossingsAlong(A, true, nearAll(A, true, [{ pts: B, closed: true }])), 18); // A's right edge at (10, 8)
+  const tb = O.trimPath(B, true, O.crossingsAlong(B, true, nearAll(B, true, [{ pts: A, closed: true }])), 37); // B's left edge at (5, 8)
+  ok('trim: overlapping squares each lose their inside part', ta.kept.length === 1 && tb.kept.length === 1);
+  const j1 = O.joinAt(ta.kept[0].pts, tb.kept[0].pts, [10, 5]);
+  ok('join: the two parts join into one closed outline round both', j1 && j1.closed && j1.pts.length === 8 && Math.abs(G.polyArea(j1.pts)) === 175, JSON.stringify(j1 && [j1.pts.length, G.polyArea(j1.pts)]));
+  const open = O.joinAt([[0, 0], [5, 0]], [[5, 0], [5, 5]], [5, 0]);
+  ok('join: two lines meeting at a point become one', open && !open.closed && open.pts.length === 3);
+  const lp = [[5, 0], [0, 0], [0, 5], [5, 0]], loop = O.joinAt(lp, lp, [5, 0]);
+  ok('join: a path whose ends meet closes', loop && loop.closed && loop.pts.length === 3);
+  ok('join: ends that do not meet are not joined', O.joinAt([[0, 0], [1, 0]], [[5, 5], [6, 6]], [1, 0]) === null);
+}
+
 console.log(fails ? `\n${fails} FAILED` : '\nall passed');
 process.exit(fails ? 1 : 0);

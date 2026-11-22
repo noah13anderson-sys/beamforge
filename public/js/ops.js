@@ -376,3 +376,99 @@ export function removeSegment(polys, pi, i) {
   }
   return [...polys.slice(0, pi), ...parts.filter(q => q.pts.length >= 2), ...polys.slice(pi + 1)];
 }
+
+// ---------------------------------------------------------------- trim (LightBurn's Trim Shapes)
+// Paths here are plain point lists in one coordinate system; "distance" means distance along the path.
+
+// Running distance along a path: cum[i] = distance from the start to point i (and cum[n] = the full loop if closed).
+export function pathCum(pts, closed) {
+  const n = pts.length, segs = closed ? n : n - 1, cum = new Float64Array(segs + 1);
+  for (let i = 0; i < segs; i++) { const a = pts[i], b = pts[(i + 1) % n]; cum[i + 1] = cum[i] + Math.hypot(b[0] - a[0], b[1] - a[1]); }
+  return cum;
+}
+
+// Where segment a→b meets segment c→d, as the fraction of the way along a→b (ends included), or -1 if they don't.
+export function segmentCross(a, b, c, d) {
+  const rx = b[0] - a[0], ry = b[1] - a[1], sx = d[0] - c[0], sy = d[1] - c[1], den = rx * sy - ry * sx;
+  const scale = Math.hypot(rx, ry) * Math.hypot(sx, sy);
+  if (!scale || Math.abs(den) < 1e-12 * scale) return -1; // parallel (or a zero-length segment)
+  const qx = c[0] - a[0], qy = c[1] - a[1], t = (qx * sy - qy * sx) / den, u = (qx * ry - qy * rx) / den, e = 1e-9;
+  return t >= -e && t <= 1 + e && u >= -e && u <= 1 + e ? Math.max(0, Math.min(1, t)) : -1;
+}
+
+// Distances along a path where it crosses other lines or itself, sorted, without repeats. near(i) lists the
+// segments to test against the path's segment i, as [cx, cy, dx, dy, j]: j is the index of a segment of this same
+// path, or -1 for other lines. A path's own neighbouring segments don't count as crossings.
+export function crossingsAlong(pts, closed, near) {
+  const n = pts.length, segs = closed ? n : n - 1, cum = pathCum(pts, closed), out = [];
+  for (let i = 0; i < segs; i++) {
+    const a = pts[i], b = pts[(i + 1) % n], len = cum[i + 1] - cum[i];
+    for (const [cx, cy, dx, dy, j] of near(i)) {
+      if (j >= 0 && (j === i || Math.abs(j - i) === 1 || (closed && Math.abs(j - i) === segs - 1))) continue;
+      const t = segmentCross(a, b, [cx, cy], [dx, dy]);
+      if (t >= 0) out.push(cum[i] + t * len);
+    }
+  }
+  out.sort((p, q) => p - q);
+  const L = cum[segs], eps = 1e-7 * (1 + L);
+  return out.filter((s, k) => (k === 0 || s - out[k - 1] > eps) && !(closed && k === out.length - 1 && out[0] + L - s <= eps));
+}
+
+// The point at distance s along a path (wrapping round a closed one).
+export function pointAlong(pts, closed, s, cum = pathCum(pts, closed)) {
+  const n = pts.length, segs = cum.length - 1, L = cum[segs];
+  const u = closed ? ((s % L) + L) % L : Math.max(0, Math.min(L, s));
+  let lo = 0, hi = segs - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (cum[mid] <= u) lo = mid; else hi = mid - 1; }
+  const a = pts[lo], b = pts[(lo + 1) % n], len = cum[lo + 1] - cum[lo], t = len > 0 ? (u - cum[lo]) / len : 0;
+  return [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+}
+
+// The part of a path between distances s0 and s1 (on a closed path s1 may run on past the start, up to s0 + length).
+export function pathSlice(pts, closed, s0, s1) {
+  const cum = pathCum(pts, closed), n = pts.length, L = cum[cum.length - 1], eps = 1e-9 * (1 + L);
+  const out = [pointAlong(pts, closed, s0, cum)];
+  for (let lap = 0; lap < (closed ? 2 : 1); lap++) for (let i = 0; i < n; i++) {
+    const at = cum[i] + lap * L;
+    if (at > s0 + eps && at < s1 - eps) out.push(pts[i]);
+  }
+  out.push(pointAlong(pts, closed, s1, cum));
+  return out;
+}
+
+// Trim a path at distance s back to the nearest crossings on either side (cuts: sorted distances).
+// → { removed: points cut out, whole: the whole path goes, kept: [{ closed: false, pts }], ends: points where kept
+// parts now end }. A path with no crossings goes completely (as in LightBurn), and so does a loop crossed only once.
+export function trimPath(pts, closed, cuts, s) {
+  const cum = pathCum(pts, closed), L = cum[cum.length - 1], eps = 1e-9 * (1 + L);
+  if (closed) {
+    if (cuts.length < 2) return { removed: pts.slice(), whole: true, kept: [], ends: [] };
+    let a = -Infinity, b = Infinity;
+    for (const c of cuts) { if (c <= s && c > a) a = c; if (c > s && c < b) b = c; }
+    if (a === -Infinity) a = cuts[cuts.length - 1] - L;
+    if (b === Infinity) b = cuts[0] + L;
+    return {
+      removed: pathSlice(pts, true, a, b), whole: false,
+      kept: [{ closed: false, pts: pathSlice(pts, true, b, a + L) }],
+      ends: [pointAlong(pts, true, a, cum), pointAlong(pts, true, b, cum)],
+    };
+  }
+  let a = 0, b = L;
+  for (const c of cuts) { if (c <= s && c > a + eps && c < L - eps) a = c; if (c > s && c < b - eps && c > eps) b = c; }
+  const kept = [], ends = [];
+  if (a > eps) { kept.push({ closed: false, pts: pathSlice(pts, false, 0, a) }); ends.push(pointAlong(pts, false, a, cum)); }
+  if (b < L - eps) { kept.push({ closed: false, pts: pathSlice(pts, false, b, L) }); ends.push(pointAlong(pts, false, b, cum)); }
+  return { removed: pathSlice(pts, false, a, b), whole: !kept.length, kept, ends };
+}
+
+// Join open paths p and q (point lists) where they both end at point at → { closed, pts }, or null. The same path
+// passed twice closes into a loop when both its ends are there.
+export function joinAt(p, q, at, eps = 1e-6) {
+  const near = r => Math.hypot(r[0] - at[0], r[1] - at[1]) <= eps;
+  if (p === q) return near(p[0]) && near(p[p.length - 1]) && p.length > 2 ? { closed: true, pts: p.slice(0, -1) } : null;
+  const A = near(p[p.length - 1]) ? p : near(p[0]) ? p.slice().reverse() : null;
+  const B = near(q[0]) ? q : near(q[q.length - 1]) ? q.slice().reverse() : null;
+  if (!A || !B) return null;
+  const pts = A.concat(B.slice(1)), f = pts[0], l = pts[pts.length - 1];
+  return Math.hypot(f[0] - l[0], f[1] - l[1]) <= eps && pts.length > 3 ? { closed: true, pts: pts.slice(0, -1) } : { closed: false, pts };
+}

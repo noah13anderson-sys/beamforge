@@ -2,9 +2,9 @@
 import * as G from './geom.js';
 import { worldPolys, worldPath, objBounds, hitObject, localPolys, textVars, resolveText } from './shapes.js';
 import { generateJob, jobFrame, frameGcode } from './gcode.js';
-import { loadImage, getImage, imageSource, imageFilter, traceImage, makeCanvas, traceSize, traceRaster, traceValues, loopsToLocal, autoTrace } from './raster.js';
+import { loadImage, getImage, imageSource, imageFilter, traceImage, makeCanvas, traceSize, traceRaster, traceValues, pathsToLocal, autoTrace } from './raster.js';
 import { offset as offsetPolys, boolean as booleanOp, joinPaths, fillet as filletPolys, reflectTf, hull, closeWithin, optimizePolys,
-  polysKey, polysInside, samplePath, dockBoxes, breakAt, removeSegment } from './ops.js';
+  polysKey, polysInside, samplePath, dockBoxes, breakAt, removeSegment, pathCum, crossingsAlong, trimPath, joinAt } from './ops.js';
 import { openMenu, closeMenu, isMenuOpen, menuAnchor } from './menu.js';
 import { DEVICE_TYPES, ORIGINS, GRBL_SETTINGS, isCnc, makeDevice, family, toMachine, mapToMachine, machineToDesign, rotaryScale, commands, screenToMachineDelta } from './devices.js';
 import { swizzle } from './ruida.js';
@@ -97,7 +97,7 @@ const S = {
   tool: 'select', view: { s: 2, ox: 40, oy: 40 },
   previewOn: false, preview: null, previewT: 1,
   m: { connected: false, port: null, state: '—', wpos: null, job: null, server: false },
-  undo: [], redo: [], clipboard: null, clipShift: 0, draft: null, cursor: null, node: null, measure: null, flash: null,
+  undo: [], redo: [], clipboard: null, clipShift: 0, draft: null, cursor: null, node: null, measure: null, flash: null, trim: null, version: 0,
 };
 
 function layerDefaults(mode = 'line') {
@@ -199,6 +199,7 @@ function edit(fn) { pushUndo(); fn(); changed(); }
 
 let previewTimer, autosaveTimer;
 function changed() {
+  S.version++; // geometry caches (the Trim tool's line index) rebuild when this changes
   S.preview = null;
   if (S.previewOn) { clearTimeout(previewTimer); previewTimer = setTimeout(buildPreview, 250); }
   clearTimeout(autosaveTimer); autosaveTimer = setTimeout(autosave, 1200);
@@ -433,6 +434,7 @@ function draw() {
     ctx.fillRect(x0, y0, x1 - x0, y1 - y0); ctx.strokeRect(x0, y0, x1 - x0, y1 - y0); ctx.setLineDash([]);
   }
   if (S.measure) drawMeasure();
+  if (!pv && S.tool === 'trim' && S.trim?.removed) drawTrim();
   drawRulers(r.width, r.height);
 }
 
@@ -565,6 +567,7 @@ cv.addEventListener('pointerdown', e => {
   }
   if (e.button !== 0 || S.previewOn) return;
   const tool = S.tool;
+  if (tool === 'trim') { trimClick(wx, wy, e.shiftKey, e.ctrlKey || e.metaKey); S.trim = trimAt(wx, wy); requestDraw(); return; }
   if (tool === 'select') {
     const sel = selected(), b = boundsOf(sel);
     if (b && !sel.some(o => o.locked)) { // locked selections have no handles
@@ -642,7 +645,14 @@ cv.addEventListener('pointermove', e => {
       const h = onHandle ? null : hitTest(wx, wy);
       cv.style.cursor = spaceDown ? 'grab' : onHandle ? 'crosshair' : h ? (h.locked ? 'default' : 'move') : 'default';
     } else if (S.tool === 'node') cv.style.cursor = nodeHit(e.offsetX, e.offsetY) ? 'move' : 'default';
-    else cv.style.cursor = spaceDown ? 'grab' : 'crosshair';
+    else if (S.tool === 'trim') {
+      const h = S.previewOn ? null : trimAt(wx, wy);
+      S.trim = h;
+      cv.style.cursor = spaceDown ? 'grab' : !h ? 'default' : h.blocked ? 'not-allowed' : SCISSORS;
+      $('#hint').textContent = h?.blocked === 'group' ? 'Grouped shapes can\'t be trimmed: right-click → Ungroup (Ctrl+U) first'
+        : h?.blocked === 'locked' ? 'This shape is locked: right-click → Unlock first' : HINTS.trim;
+      requestDraw();
+    } else cv.style.cursor = spaceDown ? 'grab' : 'crosshair';
     return;
   }
   switch (drag.kind) {
@@ -745,6 +755,132 @@ cv.addEventListener('dblclick', e => {
   if (h) insertNode(h.o, h.pi, h.i, [wx, wy]); // insert a node on the nearest segment
 });
 
+// ---- Trim tool (LightBurn's Trim Shapes): click a line to cut it back to where it crosses other lines
+const SCISSORS = `url("data:image/svg+xml,${encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke-linecap='round'>"
+  + "<g stroke='white' stroke-width='4'><circle cx='6' cy='18' r='3'/><circle cx='18' cy='18' r='3'/><path d='M8.1 15.9 19 4M15.9 15.9 5 4'/></g>"
+  + "<g stroke='black' stroke-width='1.6'><circle cx='6' cy='18' r='3'/><circle cx='18' cy='18' r='3'/><path d='M8.1 15.9 19 4M15.9 15.9 5 4'/></g></svg>")}") 12 12, crosshair`;
+let trimIndex = null;
+// Every line segment of the visible shapes, bucketed in a grid so the ones near a point or a line are quick to find.
+function trimLines() {
+  const objs = S.objects.filter(o => o.type !== 'image' && shown(o));
+  const key = `${S.version}|${objs.length}|${S.layers.map(l => (l.show === false ? 0 : 1)).join('')}`;
+  if (trimIndex && trimIndex.key === key) return trimIndex;
+  const paths = objs.map(o => worldPolys(o));
+  let n = 0, x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const ps of paths) for (const p of ps) {
+    n += p.closed ? p.pts.length : Math.max(0, p.pts.length - 1);
+    for (const [x, y] of p.pts) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  }
+  const seg = new Float64Array(n * 4), own = new Int32Array(n * 3); // ax ay bx by · shape, sub-path, segment
+  let k = 0;
+  paths.forEach((ps, oi) => ps.forEach((p, pi) => {
+    const pts = p.pts, m = pts.length;
+    for (let i = 0; i < (p.closed ? m : m - 1); i++, k++) {
+      const a = pts[i], b = pts[(i + 1) % m];
+      seg[k * 4] = a[0]; seg[k * 4 + 1] = a[1]; seg[k * 4 + 2] = b[0]; seg[k * 4 + 3] = b[1];
+      own[k * 3] = oi; own[k * 3 + 1] = pi; own[k * 3 + 2] = i;
+    }
+  }));
+  const cell = Math.max(0.25, 3 * Math.sqrt(Math.max(1e-6, (x1 - x0) * (y1 - y0)) / Math.max(1, n)));
+  const grid = new Map(), big = [], ck = (gx, gy) => gx * 1048576 + gy;
+  for (let i = 0; i < n; i++) {
+    const gx0 = Math.floor(Math.min(seg[i * 4], seg[i * 4 + 2]) / cell), gx1 = Math.floor(Math.max(seg[i * 4], seg[i * 4 + 2]) / cell);
+    const gy0 = Math.floor(Math.min(seg[i * 4 + 1], seg[i * 4 + 3]) / cell), gy1 = Math.floor(Math.max(seg[i * 4 + 1], seg[i * 4 + 3]) / cell);
+    if ((gx1 - gx0 + 1) * (gy1 - gy0 + 1) > 256) { big.push(i); continue; }
+    for (let gx = gx0; gx <= gx1; gx++) for (let gy = gy0; gy <= gy1; gy++) { let l = grid.get(ck(gx, gy)); if (!l) grid.set(ck(gx, gy), l = []); l.push(i); }
+  }
+  const mark = new Int32Array(n);
+  let stamp = 0;
+  const query = (qx0, qy0, qx1, qy1) => { // segments in the grid cells under a box
+    const out = [], push = i => { if (mark[i] !== stamp) { mark[i] = stamp; out.push(i); } };
+    stamp++;
+    const gx0 = Math.floor(qx0 / cell), gx1 = Math.floor(qx1 / cell), gy0 = Math.floor(qy0 / cell), gy1 = Math.floor(qy1 / cell);
+    if ((gx1 - gx0 + 1) * (gy1 - gy0 + 1) > 4096) { for (let i = 0; i < n; i++) push(i); return out; }
+    for (let gx = gx0; gx <= gx1; gx++) for (let gy = gy0; gy <= gy1; gy++) { const l = grid.get(ck(gx, gy)); if (l) for (const i of l) push(i); }
+    for (const i of big) push(i);
+    return out;
+  };
+  return (trimIndex = { key, objs, paths, seg, own, query });
+}
+// What a click at world point (wx, wy) would cut: { o, pi, closed, removed, whole, kept, ends }, { o, blocked }, or null.
+function trimAt(wx, wy) {
+  const ix = trimLines(), tol = 6 / S.view.s, { seg, own } = ix;
+  let best = -1, bd = Infinity;
+  for (const i of ix.query(wx - tol, wy - tol, wx + tol, wy + tol)) {
+    const d = G.distToSegment(wx, wy, seg[i * 4], seg[i * 4 + 1], seg[i * 4 + 2], seg[i * 4 + 3]);
+    if (d <= tol && (d < bd - 1e-9 || (d <= bd + 1e-9 && own[i * 3] > own[best * 3]))) { bd = d; best = i; } // ties: the top shape
+  }
+  if (best < 0) return null;
+  const oi = own[best * 3], pi = own[best * 3 + 1], si = own[best * 3 + 2], o = ix.objs[oi];
+  if (o.group) return { o, blocked: 'group' };
+  if (o.locked) return { o, blocked: 'locked' };
+  const { pts, closed } = ix.paths[oi][pi], n = pts.length, cum = pathCum(pts, closed);
+  const a = pts[si], b = pts[(si + 1) % n], dx = b[0] - a[0], dy = b[1] - a[1], L2 = dx * dx + dy * dy;
+  const t = L2 ? Math.max(0, Math.min(1, ((wx - a[0]) * dx + (wy - a[1]) * dy) / L2)) : 0;
+  const cuts = crossingsAlong(pts, closed, i => {
+    const p = pts[i], q = pts[(i + 1) % n], e = 1e-6, out = [];
+    for (const j of ix.query(Math.min(p[0], q[0]) - e, Math.min(p[1], q[1]) - e, Math.max(p[0], q[0]) + e, Math.max(p[1], q[1]) + e)) {
+      out.push([seg[j * 4], seg[j * 4 + 1], seg[j * 4 + 2], seg[j * 4 + 3], own[j * 3] === oi && own[j * 3 + 1] === pi ? own[j * 3 + 2] : -1]);
+    }
+    return out;
+  });
+  return { o, pi, closed, ...trimPath(pts, closed, cuts, cum[si] + t * (cum[si + 1] - cum[si])) };
+}
+// Cut the line under (wx, wy). keepCopy (Shift): the cut piece goes to the current layer. Unless noJoin (Ctrl), the
+// pieces left over are joined to lines on the same layer that end where they now end, into single paths.
+function trimClick(wx, wy, keepCopy, noJoin) {
+  const h = trimAt(wx, wy);
+  if (!h) return;
+  if (h.blocked === 'group') return msg('Grouped shapes can\'t be trimmed: right-click → Ungroup (Ctrl+U) first', 'err');
+  if (h.blocked === 'locked') return blockLocked([h.o], 'trimmed');
+  const o = h.o, eps = 1e-4, wasText = o.type === 'text', L = activeLayer();
+  const meet = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]) <= eps;
+  const toLocal = (obj, polys) => { const inv = G.invert(G.tfMatrix(obj.tf)); return polys.map(p => ({ closed: p.closed, pts: p.pts.map(([x, y]) => G.apply(inv, x, y)) })); };
+  edit(() => {
+    let mine = worldPolys(o).filter((_, k) => k !== h.pi).concat(h.kept);
+    const gave = new Map(); // other shapes that gave a line to a join → what they have left
+    if (!noJoin) for (const E of h.ends) {
+      const found = [];
+      const look = (list, q) => list.forEach((p, k) => {
+        if (p.closed) return;
+        if (meet(p.pts[0], E)) found.push({ q, k, list });
+        if (meet(p.pts[p.pts.length - 1], E)) found.push({ q, k, list });
+      });
+      look(mine, null);
+      for (const q of S.objects) {
+        if (q === o || q.layer !== o.layer || q.group || q.locked || q.type === 'image' || !shown(q)) continue;
+        const b = objBounds(q);
+        if (E[0] >= b.minX - eps && E[0] <= b.maxX + eps && E[1] >= b.minY - eps && E[1] <= b.maxY + eps) look(gave.get(q) || worldPolys(q), q);
+      }
+      if (found.length !== 2) continue; // nothing to join, or three or more lines end here
+      const [f, g] = found[0].q ? [found[1], found[0]] : found;
+      if (f.q) continue;
+      const j = joinAt(mine[f.k].pts, g.list[g.k].pts, E, eps); // the same line twice: it closes
+      if (!j) continue;
+      mine = mine.filter((_, k) => k !== f.k && (g.q || k !== g.k)).concat([j]);
+      if (g.q) gave.set(g.q, g.list.filter((_, k) => k !== g.k));
+    }
+    ensurePath(o);
+    o.polys = toLocal(o, mine);
+    for (const [q, rest] of gave) { ensurePath(q); q.polys = toLocal(q, rest); }
+    S.objects = S.objects.filter(q => !((q === o || gave.has(q)) && !q.polys.length));
+    if (keepCopy) pathFromWorld([{ closed: h.whole && h.closed, pts: h.removed }], { layer: L.id, name: 'Trimmed piece' });
+    S.sel = new Set(S.objects.includes(o) ? [o.id] : []);
+  });
+  if (keepCopy && L.id === o.layer) msg('The cut piece was copied onto the same layer as the shape. Pick another layer first to keep it apart.');
+  else if (wasText) msg('The text was converted to a path so it could be trimmed', 'ok');
+}
+function drawTrim() {
+  const t = S.trim;
+  ctx.save();
+  ctx.strokeStyle = '#e5484d'; ctx.lineWidth = 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.beginPath();
+  t.removed.forEach(([x, y], i) => { const [sx, sy] = toScreen(x, y); if (i) ctx.lineTo(sx, sy); else ctx.moveTo(sx, sy); });
+  if (t.whole && t.closed) ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
 // ---- node editing (polylines: sub-path pi, vertex vi; segment i runs from vertex i-1 to vertex i)
 // The line of a selected shape under world point (wx, wy), or null.
 function segmentHit(wx, wy) {
@@ -796,7 +932,7 @@ cv.addEventListener('wheel', e => {
   if (e.ctrlKey || !e.shiftKey) zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * (e.deltaMode ? 0.05 : 0.0015)));
   else { S.view.ox -= e.deltaY; requestDraw(); }
 }, { passive: false });
-cv.addEventListener('pointerleave', () => { S.cursor = null; requestDraw(); });
+cv.addEventListener('pointerleave', () => { S.cursor = null; S.trim = null; requestDraw(); });
 
 function finishLine(close) {
   const d = S.draft; S.draft = null;
@@ -826,11 +962,13 @@ const HINTS = {
   ellipse: 'Drag to draw · Shift = circle · Alt = from centre', polygon: 'Drag to draw — change sides/star in the Shape tab',
   node: 'Click a shape, then drag its points · double-click a line to add a point · Del removes the selected point',
   measure: 'Drag to measure · Shift = 45°',
+  trim: 'Click a line to cut it back to where it crosses other lines · Shift+click: keep the cut piece · Ctrl+click: don\'t join the ends',
 };
 function setTool(t) {
   if (S.draft && S.draft.kind === 'line' && t !== 'line') finishLine(false);
-  S.tool = t; S.draft = null; S.node = null;
+  S.tool = t; S.draft = null; S.node = null; S.trim = null;
   if (t !== 'measure') S.measure = null;
+  cv.style.cursor = 'default';
   $$('.tools [data-tool]').forEach(b => b.classList.toggle('active', b.dataset.tool === t));
   $('#hint').textContent = HINTS[t] || '';
   requestDraw();
@@ -840,7 +978,7 @@ $$('.tools [data-tool]').forEach(b => b.addEventListener('click', () => setTool(
 const typing = () => /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName) || $('#dlg').open;
 // Shortcuts follow LightBurn where they don't clash with BeamForge's single-letter tool keys.
 const KEYS_MOD = { z: 'undo', y: 'redo', s: 'save', o: 'open', i: 'import', e: 'export', d: 'dup', a: 'select-all', c: 'copy', x: 'cut',
-  v: 'paste', g: 'group', u: 'ungroup', pageup: 'order-front', pagedown: 'order-back' };
+  v: 'paste', g: 'group', u: 'ungroup', k: 'trim-tool', pageup: 'order-front', pagedown: 'order-back' };
 const KEYS_MOD_SHIFT = { z: 'redo', g: 'ungroup', i: 'invert-sel', c: 'topath', b: 'to-bitmap', h: 'mirror-h', v: 'mirror-v', m: 'mirror-line',
   a: 'zoom-sel', arrowleft: 'al-l', arrowright: 'al-r', arrowup: 'al-t', arrowdown: 'al-b' };
 const KEYS_ALT = { p: 'preview', v: 'paste-place', c: 'close-paths', j: 'join', d: 'dedupe', b: 'break', o: 'offset', t: 'trace', i: 'img-adjust' };
@@ -1151,7 +1289,7 @@ function traceRunner() {
       if (!job || m.id !== job.id) return;
       if (m.missing) { sent = null; send(job); return; }
       const j = job; job = null;
-      if (m.error) j.reject(new Error(m.error)); else j.resolve(unpackLoops(m.xy, m.starts));
+      if (m.error) j.reject(new Error(m.error)); else j.resolve(unpackPaths(m));
     };
     return true;
   };
@@ -1165,21 +1303,36 @@ function traceRunner() {
     stop() { cancel('stopped'); w?.terminate(); w = null; },
   };
 }
-function unpackLoops(xy, starts) {
-  const loops = [];
+function unpackPaths({ xy, starts, closed, piece }) {
+  const paths = [];
   for (let i = 0; i + 1 < starts.length; i++) {
-    const l = new Array(starts[i + 1] - starts[i]);
-    for (let j = starts[i], k = 0; j < starts[i + 1]; j++, k++) l[k] = [xy[2 * j], xy[2 * j + 1]];
-    loops.push(l);
+    const pts = new Array(starts[i + 1] - starts[i]);
+    for (let j = starts[i], k = 0; j < starts[i + 1]; j++, k++) pts[k] = [xy[2 * j], xy[2 * j + 1]];
+    paths.push({ pts, closed: !!closed[i], piece: piece[i] });
   }
-  return loops;
+  return paths;
+}
+// The layer traced shapes go on: the active one unless that is an image layer; center lines need a line layer.
+function traceLayer(center) {
+  let L = activeLayer();
+  if (L.mode === 'image') L = S.layers.find(l => l.mode !== 'image') || layerForColor(PALETTE[1]);
+  if (center && L.mode !== 'line') {
+    L = S.layers.find(l => l.mode === 'line') || layerForColor(PALETTE.find(c => !S.layers.some(l => l.color === c)) || PALETTE[0], 'line');
+  }
+  return L;
 }
 
 const TRACE_QUICK_PX = 700; // longest side of the instant (reduced-detail) preview
+// A thick line in a picture (grey) and what each kind of trace makes of it (red).
+const TRACE_WAVE = 'M5 14C11 3 17 4 20 10S29 17 35 6';
+const TRACE_LINE_ICON = {
+  outline: `<path class="cut" d="${TRACE_WAVE}" stroke-width="8"/><path class="ink" d="${TRACE_WAVE}" stroke-width="5.4"/>`,
+  center: `<path class="ink" d="${TRACE_WAVE}" stroke-width="8"/><path class="cut" d="${TRACE_WAVE}" stroke-width="1.5"/>`,
+};
 function traceDialog() {
   const o = selected().find(x => x.type === 'image');
   if (!o) return msg('Select an image to trace');
-  const prefs = { mode: 'brightness', cutoff: 0, threshold: 128, edge: 60, ignore: 6, optimize: 0.6, smooth: 0.4, res: 10, fade: true, del: false, ...(settings.trace || {}) };
+  const prefs = { mode: 'brightness', cutoff: 0, threshold: 128, edge: 60, ignore: 6, optimize: 0.6, smooth: 0.4, res: 10, center: false, fade: true, del: false, ...(settings.trace || {}) };
   const dlg = $('#dlg'), form = $('#dlg-form'), runner = traceRunner();
   const cvs = el('canvas', { class: 'trace-cv', tabindex: 0, 'aria-label': 'Trace preview',
     title: 'Scroll to zoom, drag to move around, double-click to zoom in or back out. Keys: + − 0 and arrows.' });
@@ -1200,6 +1353,29 @@ function traceDialog() {
   set.mode = v => { modeSel.value = v; prefs.mode = modeSel.value; };
   const fade = chkInput(prefs.fade, v => { prefs.fade = v; requestDraw(); });
   const del = chkInput(prefs.del, v => { prefs.del = v; });
+  // Outline or Center line: the first choice, so it can't be missed
+  const sketchHint = el('p', { class: 'small muted trace-hint', hidden: true },
+    'Sketch mode follows edges, so a thick line still gets a line along each side. For one line down its middle, use Brightness mode or press Auto trace.');
+  const linesChoice = el('div', { class: 'trace-lines', role: 'radiogroup', 'aria-label': 'Lines' });
+  const lineBtns = [
+    [false, 'Outline', '2 lines, one each side', 'Trace around the shapes: each line in the picture gets a line along both of its sides'],
+    [true, 'Center line', '1 line down the middle', 'For line drawings: one line down the middle of each line in the picture. Dots keep their outline. The lines go on a Line layer.'],
+  ].map(([on, label, sub, title]) => {
+    const b = el('button', { type: 'button', role: 'radio', title, onclick: () => setCenter(on) },
+      el('span', { class: 'ico' }), el('b', {}, label), el('span', { class: 'sub' }, sub));
+    b.querySelector('.ico').innerHTML = `<svg viewBox="0 0 40 20" aria-hidden="true">${TRACE_LINE_ICON[on ? 'center' : 'outline']}</svg>`;
+    linesChoice.append(b);
+    return b;
+  });
+  linesChoice.addEventListener('keydown', e => { // arrow keys move between the two, like any radio group
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+    e.preventDefault(); setCenter(!prefs.center); lineBtns[prefs.center ? 1 : 0].focus();
+  });
+  const showCenter = () => {
+    lineBtns.forEach((b, i) => { const on = !!prefs.center === (i === 1); b.classList.toggle('on', on); b.setAttribute('aria-checked', on); b.tabIndex = on ? 0 : -1; });
+    sketchHint.hidden = !(prefs.center && prefs.mode === 'sketch');
+  };
+  const setCenter = on => { if (!!prefs.center === on) return; prefs.center = on; showCenter(); changed(); };
   const rows = {
     cutoff: slider('cutoff', 'Cutoff', 0, 255, 1), threshold: slider('threshold', 'Threshold', 0, 255, 1),
     edge: slider('edge', 'Edge sensitivity', 1, 254, 1),
@@ -1207,10 +1383,11 @@ function traceDialog() {
   const sync = () => {
     rows.cutoff.style.display = rows.threshold.style.display = prefs.mode === 'brightness' ? '' : 'none';
     rows.edge.style.display = prefs.mode === 'sketch' ? '' : 'none';
+    showCenter();
   };
 
   // ---- tracing: an instant reduced-detail preview here, then the exact full-detail result from the worker
-  const key = () => [prefs.mode, prefs.cutoff, prefs.threshold, prefs.edge, prefs.ignore, prefs.optimize, prefs.smooth, prefs.res].join('|');
+  const key = () => [prefs.mode, prefs.cutoff, prefs.threshold, prefs.edge, prefs.ignore, prefs.optimize, prefs.smooth, prefs.res, prefs.center].join('|');
   let quick = null, full = null, fullErr = false, timer = 0, fullTimer = 0, raf = 0;
   const rasters = new Map(); // pixel values per channel and size
   const raster = (mode, W, H) => {
@@ -1223,24 +1400,24 @@ function traceDialog() {
     }
     return { k, v };
   };
-  const result = (k, loops, W, H) => {
-    const box = new Float32Array(loops.length * 4);
+  const result = (k, paths, W, H) => {
+    const box = new Float32Array(paths.length * 4);
     let pts = 0;
-    loops.forEach((l, i) => {
+    paths.forEach((p, i) => {
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-      for (const [x, y] of l) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+      for (const [x, y] of p.pts) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
       box[i * 4] = x0; box[i * 4 + 1] = y0; box[i * 4 + 2] = x1; box[i * 4 + 3] = y1;
-      pts += l.length;
+      pts += p.pts.length;
     });
-    return { key: k, loops, W, H, box, pts };
+    return { key: k, paths, W, H, box, pts, center: prefs.center };
   };
   const exact = () => full && full.key === key();
   const shown = () => (exact() ? full : quick);
   const status = () => {
     const r = shown();
     if (!r) return;
-    const n = r.loops.length;
-    info.textContent = `${n.toLocaleString()} shape${n === 1 ? '' : 's'} · ${r.pts.toLocaleString()} points`
+    const n = r.paths.length;
+    info.textContent = `${n.toLocaleString()} ${r.center ? 'line' : 'shape'}${n === 1 ? '' : 's'} · ${r.pts.toLocaleString()} points`
       + (exact() ? '' : runner.ok && !fullErr ? ' · refining…' : ' · reduced-detail preview');
   };
   const syncFull = () => {
@@ -1318,11 +1495,11 @@ function traceDialog() {
       const sx = o.w * k / r.W, sy = o.h * k / r.H;
       const vx0 = -x0 / sx, vy0 = -y0 / sy, vx1 = (Wc - x0) / sx, vy1 = (Hc - y0) / sy; // the visible part, in trace pixels
       g.strokeStyle = '#e5484d'; g.lineWidth = 1.25 * dpr(); g.lineJoin = 'round'; g.beginPath();
-      r.loops.forEach((l, i) => {
-        const b = i * 4;
+      r.paths.forEach((p, i) => {
+        const b = i * 4, l = p.pts;
         if (r.box[b + 2] < vx0 || r.box[b] > vx1 || r.box[b + 3] < vy0 || r.box[b + 1] > vy1) return;
         for (let j = 0; j < l.length; j++) { const X = x0 + l[j][0] * sx, Y = y0 + l[j][1] * sy; if (j) g.lineTo(X, Y); else g.moveTo(X, Y); }
-        g.closePath();
+        if (p.closed) g.closePath();
       });
       g.stroke();
     }
@@ -1382,11 +1559,13 @@ function traceDialog() {
   // ---- Auto trace: look at the picture and choose the settings
   const AUTO_KEYS = ['mode', 'cutoff', 'threshold', 'edge', 'ignore', 'optimize', 'smooth', 'res'];
   const describe = a => {
-    const what = a.mode === 'transparency' ? 'the outline of the non-transparent parts'
-      : a.mode === 'sketch' ? `edges, sensitivity ${a.edge}`
-        : a.lightBg ? `dark shapes on a light background (threshold ${a.threshold})` : `light shapes on a dark background (cutoff ${a.cutoff})`;
+    const what = a.lines ? `one line down the middle of each ${a.lightBg ? `dark line (threshold ${a.threshold})` : `light line (cutoff ${a.cutoff})`}`
+      : a.edges ? `no clear lines in this picture, so one line along each edge (Sketch mode, sensitivity ${a.edge})`
+        : a.mode === 'transparency' ? `the ${a.center ? 'middle' : 'outline'} of the non-transparent parts`
+          : a.mode === 'sketch' ? `edges, sensitivity ${a.edge}`
+            : a.lightBg ? `dark shapes on a light background (threshold ${a.threshold})` : `light shapes on a dark background (cutoff ${a.cutoff})`;
     return `Auto trace: ${what}${a.noisy ? `; specks under ${a.ignore} px² left out` : ''}.`
-      + (a.photo && a.mode === 'brightness' ? ' This looks like a photo, so the result is a two-tone stencil; Sketch mode traces outlines instead.' : '')
+      + (a.photo && a.mode === 'brightness' && !a.lines ? ' This looks like a photo, so the result is a two-tone stencil; Sketch mode traces outlines instead.' : '')
       + ' Adjust anything, then press Trace.';
   };
   const autoBtn = el('button', { type: 'button', class: 'auto-btn', title: 'Look at the picture and choose the mode, threshold and clean-up settings for it' }, 'Auto trace');
@@ -1416,7 +1595,7 @@ function traceDialog() {
           zoomLbl,
           el('button', { type: 'button', title: 'Zoom in (+)', 'aria-label': 'Zoom in', onclick: () => zoomStep(1.5) }, '+'),
           el('button', { type: 'button', title: 'Show the whole picture (0)', onclick: fit }, 'Fit'))),
-      el('div', { class: 'trace-side' }, autoBtn, note,
+      el('div', { class: 'trace-side' }, linesChoice, sketchHint, autoBtn, note,
         el('div', { class: 'scroll' },
           field('Mode', modeSel), rows.cutoff, rows.threshold, rows.edge,
           slider('ignore', 'Ignore less than (px²)', 0, 400, 1), slider('smooth', 'Smoothness', 0, 1, 0.05),
@@ -1432,15 +1611,19 @@ function traceDialog() {
     settings.trace = { ...prefs }; saveSettings();
     if (dlg.returnValue !== 'ok') return;
     try {
-      const polys = exact() ? loopsToLocal(full.loops, o, full.W, full.H) : traceImage(o, prefs).polys;
-      if (!polys.length) return msg('Nothing found with those settings', 'err');
+      const paths = exact() ? pathsToLocal(full.paths, o, full.W, full.H) : traceImage(o, prefs).paths;
+      if (!paths.length) return msg('Nothing found with those settings', 'err');
+      // one shape per piece (an outline with its holes, or a connected set of lines), grouped like LightBurn's result
+      const pieces = new Map(), m = G.tfMatrix(o.tf), made = [];
+      for (const p of paths) { if (!pieces.has(p.piece)) pieces.set(p.piece, []); pieces.get(p.piece).push({ closed: p.closed, pts: p.pts }); }
       edit(() => {
-        const L = activeLayer().mode === 'image' ? (S.layers.find(l => l.mode !== 'image') || layerForColor(PALETTE[1])) : activeLayer();
-        const p = addObject({ type: 'path', name: 'Traced ' + (o.name || 'image'), polys, layer: L.id, tf: { ...o.tf } });
+        const L = traceLayer(prefs.center), group = pieces.size > 1 ? uid() : undefined, name = 'Traced ' + (o.name || 'image');
+        for (const polys of pieces.values()) made.push(pathFromWorld(G.transformPolys(polys, m), { name, layer: L.id, group }));
         if (prefs.del && !o.locked) S.objects = S.objects.filter(x => x !== o); // a locked image is kept
-        S.sel = new Set([p.id]);
+        S.sel = new Set(made.map(p => p.id));
       });
-      msg(`Traced ${polys.length} shape(s)`, 'ok');
+      const what = `${paths.length} ${prefs.center ? 'line' : 'shape'}${paths.length === 1 ? '' : 's'}`;
+      msg(made.length > 1 ? `Traced ${what} as ${made.length} pieces, grouped — Ctrl+U ungroups them` : `Traced ${what}`, 'ok');
     } catch (e) { msg(e.message, 'err'); }
   };
   dlg.classList.add('trace-dlg');
@@ -1902,6 +2085,7 @@ const ACTIONS = {
   },
   trace() { traceDialog(); },
   'tool-node'() { setTool('node'); },
+  'trim-tool'() { setTool(S.tool === 'trim' ? 'select' : 'trim'); },
   'tool-measure'() { setTool('measure'); },
   fit: zoomFit,
   preview() {
@@ -2316,7 +2500,8 @@ function canvasMenu(c) {
     { label: 'Move', sub: moveItems(c) },
     { label: 'Draw order', sub: orderItems(c) },
     '-',
-    { label: 'Path tools', sub: [...pathItems(c), mi('Create rubber-band outline', 'rubber-band', c), '-', mi('Edit nodes', 'tool-node', c, { kbd: 'N' })] },
+    { label: 'Path tools', sub: [...pathItems(c), mi('Create rubber-band outline', 'rubber-band', c), '-', mi('Edit nodes', 'tool-node', c, { kbd: 'N' }),
+      mi('Trim shapes', 'trim-tool', c, { kbd: 'Ctrl+K', title: 'Click lines to cut them back to where they cross other lines' })] },
     { label: 'Boolean & offset', sub: boolItems(c) },
     { label: 'Array & copy', sub: arrayItems(c) },
     c.imgs.length ? { label: 'Image', sub: imageItems(c) } : null,
@@ -2458,6 +2643,7 @@ const BAR = {
     mi('Pack onto the bed…', 'pack', c, { why: ['lock'] }),
     '-',
     mi('Edit nodes', 'tool-node', c, { kbd: 'N' }),
+    mi('Trim shapes', 'trim-tool', c, { kbd: 'Ctrl+K', title: 'Click lines to cut them back to where they cross other lines' }),
     mi('Measure', 'tool-measure', c, { kbd: 'M' }),
   ],
   laser: c => [

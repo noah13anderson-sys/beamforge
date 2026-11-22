@@ -2,13 +2,13 @@
   --bg: #16181c; --panel: #1e2126; --panel-2: #262a30; --line: #343941; --text: #e6e8eb; --muted: #9098a3;
   --accent: #ff6a2a; --accent-2: #ffa36e; --danger: #e5484d; --ok: #3fb950; --warn: #d29922;
   --canvas-bg: #2a2e35; --bed: #f3f1ec; --grid: #e2dfd7; --grid-major: #cbc6ba; --sel: #0b7bff;
-  --travel: rgba(0, 140, 255, .55); --burn: #ff4d00;
+  --travel: rgba(0, 140, 255, .55); --burn: #ff4d00; --trace-ink: #6e7682;
   color-scheme: dark;
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
     --bg: #eceef1; --panel: #ffffff; --panel-2: #f3f4f6; --line: #d6d9de; --text: #1b1e23; --muted: #646c78;
-    --canvas-bg: #d9dce1; color-scheme: light;
+    --canvas-bg: #d9dce1; --trace-ink: #b4bac3; color-scheme: light;
   }
 }
 * { box-sizing: border-box; }
@@ -220,6 +220,18 @@ dialog.trace-dlg { width: min(1180px, calc(100vw - 32px)); }
 .trace-side .scroll { max-height: min(56vh, 560px); }
 .trace-side .fld { grid-template-columns: 104px minmax(0, 1fr); }
 .trace-side .fld.chk { grid-template-columns: 18px 1fr; }
+/* Outline / Center line: two big buttons, each with a picture of what it does to a thick line */
+.trace-lines { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.trace-lines button {
+  display: grid; justify-items: center; gap: 2px; padding: 7px 6px 6px; white-space: normal; text-align: center; line-height: 1.25;
+}
+.trace-lines button.on { background: rgba(255, 106, 42, .13); border-color: var(--accent); color: var(--text); box-shadow: inset 0 0 0 1px var(--accent); }
+.trace-lines .sub { font-size: 11.5px; color: var(--muted); }
+.trace-lines button.on .sub { color: var(--text); }
+.trace-lines svg { display: block; width: 54px; height: 27px; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.trace-lines .ink { stroke: var(--trace-ink); }
+.trace-lines .cut { stroke: #e5484d; }
+.trace-hint { margin: 0; line-height: 1.4; }
 .auto-btn { justify-self: stretch; padding: 6px 9px; font-weight: 600; }
 .auto-note { margin: 0; color: var(--text); line-height: 1.4; }
 .auto-note.warn { color: var(--warn); }

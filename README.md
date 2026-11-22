@@ -71,13 +71,19 @@ Always clamp the material, check the bit is tight, wear eye and ear protection, 
 `{serial:4}`, `{date}`, `{time}`, `{year}`, `{month}`, `{day}`), node editing, measure tool, handles for
 move/scale/rotate, numeric position/size/rotation, snap to grid, undo/redo.
 
-**Trace image** (live preview) — **Auto trace** looks at the picture and picks the mode, threshold and clean-up
-(dark on light or light on dark, white logos on transparent PNGs, speckled scans); then adjust anything and press Trace.
+**Trace image** (live preview) — first choose **Outline** (2 lines: one along each side of every line in the picture)
+or **Center line** (1 line down the middle of each line: for line drawings, sketches, cartoon outlines and single-line
+engraving; dots keep their outline, and the lines go on a Line layer). **Auto trace** looks at the picture and picks
+the mode, threshold and clean-up (dark on light or light on dark, white logos on transparent PNGs, speckled scans);
+with Center line it picks out the picture's lines — on coloured artwork with dark outlines, just the outlines — or,
+when there are no clear lines, one line along each edge. Then adjust anything and press Trace.
 Zoom into the preview to check the detail: scroll to zoom, drag to move around, double-click to zoom in or back out,
 or + / − / 0 and the arrow keys. The preview refines to the exact final trace in the background. Brightness band
-(cutoff → threshold), sketch/edge tracing, PNG transparency; ignore small specks, smoothness (sharp corners stay
-sharp), optimize, detail, fade preview, delete image after tracing. Outlines land on the picture's edges to within a
-fraction of a pixel, so traced parts come out the right size.
+(cutoff → threshold), sketch/edge tracing (Sketch follows edges, so with Center line a thick line still gets a line on
+each side; Brightness puts one down its middle), PNG transparency; ignore small specks,
+smoothness (sharp corners stay sharp), optimize, detail, fade preview, delete image after tracing. Outlines land on the
+picture's edges to within a fraction of a pixel, so traced parts come out the right size. The result is a group of
+pieces (each outline with its holes, or each connected set of lines): Ctrl+U ungroups them to edit them one by one.
 
 **Right-click menus** (like LightBurn's) — right-click a shape to select it and get Cut / Copy / Duplicate / Paste
 (lands where you clicked) / Paste in place / Delete, plus submenus for Select, Flip & rotate, Align, Distribute & size,
@@ -96,6 +102,12 @@ horizontally/vertically/both, mirror a copy, mirror across a line at any angle; 
 bed centre, corners or edges, to the laser position or by a distance; dock against other shapes or the bed edge; draw
 order (front/forward/backward/back); grid array, circular array, copy along a path, rubber-band outline.
 
+**Trim** (scissors in the toolbar, Ctrl+K, like LightBurn's Trim Shapes) — click a line to cut it back to where it
+crosses other lines; a line that crosses nothing is removed. Hover to see in red what will go. The pieces left over are
+joined where they used to cross (so trimming the inside of two overlapping shapes leaves one outline round both);
+Ctrl+click doesn't join, Shift+click keeps a copy of the cut piece on the current layer. Grouped shapes need
+ungrouping first.
+
 **Shape tools** — weld, subtract, intersect, exclude, offset (round/sharp/bevel), fillet (round) and chamfer corners, convert to path,
 convert to bitmap, break apart, auto-join, close paths (also with a gap tolerance), optimize (fewer points), delete
 duplicates; select open shapes, open shapes on fill layers, shapes inside the selection, or shapes smaller than the
@@ -105,7 +117,7 @@ Output is on, and the Start dialog says so.
 **Shortcuts** (LightBurn's where they don't clash with the one-letter tool keys) — Ctrl+Shift+I invert selection,
 Alt+V paste in place, Ctrl+U ungroup, Ctrl+Shift+C convert to path, Ctrl+Shift+B convert to bitmap, Alt+C close path,
 Alt+J auto-join, Alt+Shift+O optimize, Alt+D delete duplicates, Alt+B break apart, Alt+O offset, Alt+T trace,
-Alt+I adjust image, Ctrl+Shift+H / V flip, Ctrl+Shift+M mirror across a line, Ctrl+Shift+arrows align,
+Alt+I adjust image, Ctrl+K trim, Ctrl+Shift+H / V flip, Ctrl+Shift+M mirror across a line, Ctrl+Shift+arrows align,
 Alt+Shift+H / V move together, PgUp / PgDn draw order (Ctrl for front/back), Ctrl+Shift+A zoom to selection, + / − zoom.
 Edit nodes: D delete point, B break, I insert point under the pointer. Drawing a line: Backspace removes the last point.
 
