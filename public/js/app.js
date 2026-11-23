@@ -62,7 +62,7 @@ const PALETTE = ['#1d1d1f', '#1f6feb', '#e5484d', '#2da44e', '#e08a00', '#8957e5
 
 const APP_DEFAULTS = {
   startFrom: 'absolute', anchor: 'bl', jogStep: '10', jogF: 3000, pulsePower: 1, pulseMs: 200, framePower: 1,
-  snap: 0, lockAspect: true, alignTo: 'auto', serial: 1, serialAuto: true, devices: [], deviceId: null,
+  snap: 0, lockAspect: true, alignTo: 'auto', serial: 1, serialAuto: true, devices: [], deviceId: null, speedUnit: 'mm/s',
 };
 function loadSettings() {
   let s = {};
@@ -83,6 +83,13 @@ function saveSettings() { try { localStorage.setItem('beamforge.settings', JSON.
 const dev = () => settings.devices.find(d => d.id === settings.deviceId) || settings.devices[0];
 textVars.serial = settings.serial;
 if (settings.csv) { textVars.csv = settings.csv; textVars.csvRow = settings.csvRow || 0; }
+
+// Speeds are kept in mm/s (laser layers, travel, material presets and tests) or, where the controller takes them that
+// way, in mm/min (jog and CNC feed rates). Edit → Preferences → Speed units picks how every speed is shown and typed.
+const perMin = () => settings.speedUnit === 'mm/min';
+const speedUnit = () => (perMin() ? 'mm/min' : 'mm/s');
+const showSpeed = mmPerS => +(mmPerS * (perMin() ? 60 : 1)).toFixed(perMin() ? 1 : 2); // mm/s → the chosen units
+const readSpeed = shown => shown / (perMin() ? 60 : 1); // the chosen units → mm/s
 
 // ================================================================ material library
 function loadLib() { try { return JSON.parse(localStorage.getItem('beamforge.materials') || '[]'); } catch { return []; } }
@@ -1064,10 +1071,11 @@ function formDialog(title, fields, { ok = 'OK', note, wide } = {}) {
           : el('label', { class: 'fld' + (wide ? ' wide' : '') }, el('span', {}, f.label), inp));
     }
     form.append(box);
-    form.append(el('div', { class: 'actions' },
-      el('button', { value: 'cancel', type: 'submit', formnovalidate: true }, 'Cancel'),
+    form.append(el('div', { class: 'actions' }, // Cancel is a plain button so that Enter in a box means OK, not Cancel
+      el('button', { type: 'button', onclick: () => dlg.close('cancel') }, 'Cancel'),
       el('button', { value: 'ok', type: 'submit', class: 'primary' }, ok)));
     dlg.onclose = () => {
+      if (dlg.open) return; // the close event of the dialog this one replaced (it arrives after this one opens)
       if (dlg.returnValue !== 'ok') return resolve(null);
       const out = {};
       for (const f of fields) {
@@ -1091,7 +1099,7 @@ function panelDialog(title, render) {
     const redraw = () => body.replaceChildren(...[render(redraw)].flat());
     form.replaceChildren(el('h2', {}, title), body, el('div', { class: 'actions' }, el('button', { value: 'ok', type: 'submit', class: 'primary' }, 'Done')));
     redraw();
-    dlg.onclose = () => resolve();
+    dlg.onclose = () => { if (!dlg.open) resolve(); }; // (not the close event of the dialog this one replaced)
     dlg.returnValue = '';
     if (!dlg.open) dlg.showModal();
   });
@@ -1116,6 +1124,7 @@ async function createText(x, y) {
 
 async function preferencesDialog() {
   const v = await formDialog('Preferences', [
+    { key: 'speedUnit', label: 'Speed units', type: 'select', value: speedUnit(), options: [['mm/s', 'mm/s — millimetres per second'], ['mm/min', 'mm/min — millimetres per minute']] },
     { key: 'snap', label: 'Snap to grid (mm, 0 = off)', type: 'number', value: settings.snap, min: 0 },
     { key: 'pulsePower', label: 'Test fire power (%)', type: 'number', value: settings.pulsePower, min: 0, max: 100 },
     { key: 'pulseMs', label: 'Test fire length (ms)', type: 'number', value: settings.pulseMs, min: 10, max: 2000 },
@@ -1126,7 +1135,7 @@ async function preferencesDialog() {
   if (!v) return;
   for (const [k, val] of Object.entries(v)) if (!(typeof val === 'number' && Number.isNaN(val))) settings[k] = val;
   textVars.serial = settings.serial;
-  saveSettings(); changed();
+  saveSettings(); changed(); showJogSpeed(); refreshPanels();
 }
 
 async function deviceEditDialog(d) {
@@ -1137,7 +1146,7 @@ async function deviceEditDialog(d) {
     { key: 'bedH', label: 'Work area height (mm)', type: 'number', value: d.bedH, min: 10 },
     { key: 'origin', label: 'Origin (home corner)', type: 'select', value: d.origin, options: ORIGINS },
     { key: 'sMax', label: 'Max S value', type: 'number', value: d.sMax, min: 0.001 },
-    { key: 'travel', label: 'Travel speed (mm/s)', type: 'number', value: d.travel, min: 1 },
+    { key: 'travel', label: `Travel speed (${speedUnit()})`, type: 'number', value: showSpeed(d.travel), min: showSpeed(1) },
     { key: 'baud', label: 'Baud rate', type: 'select', value: String(d.baud), options: ['115200', '250000', '230400', '57600', '38400', '9600'].map(b => [b, b]) },
     { key: 'air', label: 'Air assist command', type: 'select', value: d.air, options: [['M8', 'M8 (flood coolant pin)'], ['M7', 'M7 (mist coolant pin)'], ['none', 'None']] },
     { key: 'returnHome', label: 'Return to start when the job finishes', type: 'check', value: d.returnHome },
@@ -1151,6 +1160,7 @@ async function deviceEditDialog(d) {
     { key: 'n', type: 'note', label: 'Max S: GRBL uses $30 (usually 1000). Smoothieware uses 1 (power 0.0–1.0). Marlin uses 255 by default. Changing the controller type resets Max S to its usual value.' },
   ], { ok: 'Save', wide: true });
   if (!v) return false;
+  v.travel = readSpeed(v.travel); // typed in the chosen units, kept in mm/s
   const typeChanged = v.type !== d.type;
   for (const [k, val] of Object.entries(v)) if (!(typeof val === 'number' && Number.isNaN(val))) d[k] = val;
   d.magic = Number(d.magic) || 0x88;
@@ -1233,7 +1243,7 @@ function libraryDialog() {
     const lib = loadLib();
     const L = activeLayer();
     const rows = lib.length ? lib.map(p => el('div', { class: 'ditem' },
-      el('span', { class: 't' }, el('b', {}, `${p.material} ${p.thickness ? p.thickness + ' mm' : ''}`), el('span', { class: 'muted small' }, ` · ${p.name} · ${p.settings.mode} ${p.settings.speed} mm/s ${p.settings.power}%`)),
+      el('span', { class: 't' }, el('b', {}, `${p.material} ${p.thickness ? p.thickness + ' mm' : ''}`), el('span', { class: 'muted small' }, ` · ${p.name} · ${p.settings.mode} ${showSpeed(p.settings.speed)} ${speedUnit()} ${p.settings.power}%`)),
       el('span', { class: 'row' },
         el('button', { type: 'button', title: `Apply to ${L.name}`, onclick: () => { edit(() => Object.assign(L, p.settings)); msg(`Applied "${p.name}" to ${L.name}`, 'ok'); } }, 'Apply'),
         el('button', { type: 'button', onclick: () => { saveLib(lib.filter(x => x !== p)); redraw(); } }, 'Delete'))))
@@ -1602,10 +1612,11 @@ function traceDialog() {
           slider('optimize', 'Optimize (px)', 0.05, 3, 0.05), slider('res', 'Detail (px/mm)', 2, 30, 1),
           check('Fade image in preview', fade), check('Delete the image after tracing', del)))),
     el('div', { class: 'actions' },
-      el('button', { value: 'cancel', type: 'submit', formnovalidate: true }, 'Cancel'),
+      el('button', { type: 'button', onclick: () => dlg.close('cancel') }, 'Cancel'),
       el('button', { value: 'ok', type: 'submit', class: 'primary' }, 'Trace')));
   sync();
   dlg.onclose = () => {
+    if (dlg.open) return; // the close event of a dialog this one replaced
     clearTimeout(timer); clearTimeout(fullTimer); cancelAnimationFrame(raf); ro.disconnect(); runner.stop();
     dlg.classList.remove('trace-dlg');
     settings.trace = { ...prefs }; saveSettings();
@@ -1712,13 +1723,14 @@ function viewCentre() {
 // Material test: a grid of squares, each on its own layer with its own speed/power, plus labels.
 async function materialTestDialog() {
   const T = settings.mtest || { mode: 'fill', pMin: 10, pMax: 100, sMin: 50, sMax: 300, cols: 5, rows: 5, cell: 10, gap: 3, labels: true, lp: 20, ls: 150, passes: 1, interval: 0.1 };
+  const u = speedUnit(); // speeds below are in these units; settings.mtest keeps them in mm/s
   const v = await formDialog('Material test', [
     { key: 'mode', label: 'Test type', type: 'select', value: T.mode, options: [['fill', 'Fill (engraving)'], ['line', 'Line (cutting / scoring)']] },
     { key: 'pMin', label: 'Power from (%)', type: 'number', value: T.pMin, min: 0, max: 100 },
     { key: 'pMax', label: 'Power to (%)', type: 'number', value: T.pMax, min: 0, max: 100 },
     { key: 'cols', label: 'Power steps (columns)', type: 'number', value: T.cols, min: 1, max: 12, step: 1 },
-    { key: 'sMin', label: 'Speed from (mm/s)', type: 'number', value: T.sMin, min: 0.1 },
-    { key: 'sMax', label: 'Speed to (mm/s)', type: 'number', value: T.sMax, min: 0.1 },
+    { key: 'sMin', label: `Speed from (${u})`, type: 'number', value: showSpeed(T.sMin), min: showSpeed(0.1) },
+    { key: 'sMax', label: `Speed to (${u})`, type: 'number', value: showSpeed(T.sMax), min: showSpeed(0.1) },
     { key: 'rows', label: 'Speed steps (rows)', type: 'number', value: T.rows, min: 1, max: 12, step: 1 },
     { key: 'passes', label: 'Passes', type: 'number', value: T.passes, min: 1, step: 1 },
     { key: 'interval', label: 'Fill line interval (mm)', type: 'number', value: T.interval, min: 0.01 },
@@ -1726,12 +1738,12 @@ async function materialTestDialog() {
     { key: 'gap', label: 'Gap between squares (mm)', type: 'number', value: T.gap, min: 0 },
     { key: 'labels', label: 'Engrave labels (power across the top, speed down the side)', type: 'check', value: T.labels },
     { key: 'lp', label: 'Label power (%)', type: 'number', value: T.lp, min: 0, max: 100 },
-    { key: 'ls', label: 'Label speed (mm/s)', type: 'number', value: T.ls, min: 0.1 },
+    { key: 'ls', label: `Label speed (${u})`, type: 'number', value: showSpeed(T.ls), min: showSpeed(0.1) },
     { key: 'n', type: 'note', label: 'Adds one layer per square to this project (named with its settings), placed at the top-left of the bed. Frame it, run it, then pick the best square and save it to the Material library. Delete the test layers afterwards.' },
   ], { ok: 'Create test', wide: true });
   if (!v) return;
   const cols = clamp(Math.round(v.cols) || 1, 1, 12), rows = clamp(Math.round(v.rows) || 1, 1, 12);
-  settings.mtest = { ...v, cols, rows }; saveSettings();
+  settings.mtest = { ...v, cols, rows, sMin: readSpeed(v.sMin), sMax: readSpeed(v.sMax), ls: readSpeed(v.ls) }; saveSettings();
   const lerp = (a, b, i, n) => n > 1 ? a + (b - a) * i / (n - 1) : a;
   const cell = v.cell || 10, gap = v.gap ?? 3, ts = Math.max(1.5, Math.min(cell * 0.35, 5));
   const left = 5 + (v.labels ? ts * 3.2 : 0), top = 5 + (v.labels ? ts * 2 : 0);
@@ -1739,12 +1751,12 @@ async function materialTestDialog() {
     const ids = [];
     for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
       const power = Math.round(lerp(v.pMin, v.pMax, c, cols)), speed = +lerp(v.sMin, v.sMax, r, rows).toFixed(1);
-      const L = { ...makeLayer(hslHex((r * cols + c) * 137.508 % 360, 65, 45), v.mode), name: `Test P${power}% S${speed}`, power, speed, passes: Math.max(1, Math.round(v.passes) || 1), interval: v.interval || 0.1, air: v.mode === 'line' };
+      const L = { ...makeLayer(hslHex((r * cols + c) * 137.508 % 360, 65, 45), v.mode), name: `Test P${power}% S${speed}`, power, speed: readSpeed(speed), passes: Math.max(1, Math.round(v.passes) || 1), interval: v.interval || 0.1, air: v.mode === 'line' };
       S.layers.push(L);
       ids.push(addObject({ type: 'rect', w: cell, h: cell, radius: 0, layer: L.id, name: L.name, tf: { x: left + c * (cell + gap) + cell / 2, y: top + r * (cell + gap) + cell / 2, sx: 1, sy: 1, r: 0 } }).id);
     }
     if (v.labels) {
-      const LL = { ...makeLayer('#404a57', 'fill'), name: 'Test labels', power: v.lp, speed: v.ls, interval: 0.1, air: false };
+      const LL = { ...makeLayer('#404a57', 'fill'), name: 'Test labels', power: v.lp, speed: readSpeed(v.ls), interval: 0.1, air: false };
       S.layers.push(LL);
       const txt = (text, x, y) => ids.push(addObject({ type: 'text', text, font: 'sans-serif', size: ts, bold: true, italic: false, align: 'center', layer: LL.id, tf: { x, y, sx: 1, sy: 1, r: 0 } }).id);
       for (let c = 0; c < cols; c++) txt(`${Math.round(lerp(v.pMin, v.pMax, c, cols))}`, left + c * (cell + gap) + cell / 2, top - ts * 0.9);
@@ -1753,7 +1765,7 @@ async function materialTestDialog() {
     }
     S.sel = new Set(ids);
   });
-  msg(`Material test: ${rows * cols} squares (power ${v.pMin}→${v.pMax}% across, speed ${v.sMin}→${v.sMax} mm/s down)`, 'ok');
+  msg(`Material test: ${rows * cols} squares (power ${v.pMin}→${v.pMax}% across, speed ${v.sMin}→${v.sMax} ${u} down)`, 'ok');
 }
 
 // Pack objects onto the bed in rows (bounding-box nesting). Groups stay together.
@@ -3369,6 +3381,12 @@ function numInput(value, onset, opts = {}) {
   i.addEventListener('change', () => { const v = parseFloat(i.value); if (!Number.isNaN(v)) onset(opts.min != null ? Math.max(opts.min, opts.max != null ? Math.min(opts.max, v) : v) : v); });
   return i;
 }
+// A number box for a speed, shown and typed in the chosen units. The value (and min) are in mm/s, or in mm/min with
+// perMinute: true.
+function speedInput(value, onset, { min = 0.1, perMinute = false } = {}) {
+  const k = perMinute ? 60 : 1;
+  return numInput(showSpeed(value / k), v => onset(readSpeed(v) * k), { min: showSpeed(min / k) });
+}
 function selInput(value, options, onset) {
   const s = el('select', {}, options.map(([v, l]) => el('option', { value: v }, l)));
   s.value = value; s.addEventListener('change', () => onset(s.value));
@@ -3401,8 +3419,8 @@ function renderCncLayer(L, setL) {
     field('Cut depth (mm)', numInput(L.depth ?? 3, setL('depth'), { min: 0.01 })),
     field('Depth per pass (mm)', numInput(L.stepDown ?? 1, setL('stepDown'), { min: 0.01 })),
     el('div', { class: 'muted small', style: 'margin:-2px 0 2px 120px' }, `${passes} pass${passes === 1 ? '' : 'es'} · Z0 is the top of the material`),
-    field('Feed rate (mm/min)', numInput(L.feed ?? 1000, setL('feed'), { min: 1 })),
-    field('Plunge rate (mm/min)', numInput(L.plunge ?? 300, setL('plunge'), { min: 1 })),
+    field(`Feed rate (${speedUnit()})`, speedInput(L.feed ?? 1000, setL('feed'), { min: 1, perMinute: true })),
+    field(`Plunge rate (${speedUnit()})`, speedInput(L.plunge ?? 300, setL('plunge'), { min: 1, perMinute: true })),
     field('Spindle speed (RPM)', numInput(L.rpm ?? 12000, setL('rpm'), { min: 0 })));
   if (op === 'pocket') kids.push(field('Stepover (% of tool)', numInput(L.stepover ?? 40, setL('stepover'), { min: 5, max: 95 })));
   if (op === 'drill') kids.push(field('Peck depth (mm, 0 = none)', numInput(L.peck ?? 0, setL('peck'), { min: 0 })),
@@ -3445,7 +3463,7 @@ function renderLayers() {
       el('span', { class: 'nm' }, `${L.name} `, el('span', { class: 'muted small' }, `· ${counts.get(L.id) || 0}`)),
       el('span', { class: 'meta' }, isCnc(dev())
         ? `${CNC_OPS[L.cncOp || 'profile'].split(' ')[0]}${(L.cncOp || 'profile') === 'profile' ? ` ${L.cncSide || 'outside'}` : ''} ${L.depth ?? 3}mm Ø${L.toolDia ?? 3.175}`
-        : `${MODE_LABEL[L.mode]} ${L.speed}mm/s ${L.power}%${L.passes > 1 ? ` ×${L.passes}` : ''}`),
+        : `${MODE_LABEL[L.mode]} ${showSpeed(L.speed)}${speedUnit()} ${L.power}%${L.passes > 1 ? ` ×${L.passes}` : ''}`),
       el('span', { class: 'ord' },
         el('button', { title: 'Move up (runs earlier)', disabled: i === 0, onclick: ev => { ev.stopPropagation(); edit(() => { S.layers.splice(i - 1, 0, S.layers.splice(i, 1)[0]); }); } }, '▲'),
         el('button', { title: 'Move down (runs later)', disabled: i === S.layers.length - 1, onclick: ev => { ev.stopPropagation(); edit(() => { S.layers.splice(i + 1, 0, S.layers.splice(i, 1)[0]); }); } }, '▼')),
@@ -3475,7 +3493,7 @@ function renderLayers() {
     field('Name', (() => { const i = el('input', { value: L.name }); i.addEventListener('change', () => edit(() => { L.name = i.value || L.name; })); return i; })()),
     field('Colour', (() => { const i = el('input', { type: 'color', value: L.color }); i.addEventListener('change', () => edit(() => { L.color = i.value; })); return i; })()),
     field('Mode', selInput(L.mode, [['line', 'Line — follow the outline'], ['fill', 'Fill — scan the inside'], ['offset', 'Offset fill — concentric'], ['image', 'Image — engrave bitmaps']], setL('mode'))),
-    field('Speed (mm/s)', numInput(L.speed, setL('speed'), { min: 0.1 })),
+    field(`Speed (${speedUnit()})`, speedInput(L.speed, setL('speed'))),
     field(L.mode === 'image' ? 'Max power (%)' : 'Power (%)', numInput(L.power, setL('power'), { min: 0, max: 100 })),
     field('Passes', numInput(L.passes, v => edit(() => { L.passes = Math.max(1, Math.round(v)); }), { min: 1, step: 1 })),
     check('Air assist', chkInput(L.air, setL('air'))),
@@ -3795,11 +3813,18 @@ const isRuida = () => family(dev()) === 'ruida';
 
 $('#m-refresh').addEventListener('click', refreshPorts);
 $('#m-step').value = settings.jogStep;
-$('#m-jogf').value = settings.jogF;
+// Jog and frame speed: kept in mm/min for the controller, shown and typed in the chosen units
+const jogF = () => settings.jogF || 3000;
+function showJogSpeed() {
+  const i = $('#m-jogf');
+  i.value = showSpeed(jogF() / 60); i.min = showSpeed(10 / 60); i.step = perMin() ? 100 : 1;
+  $('#m-jogf-unit').textContent = `Speed ${speedUnit()}`;
+}
+showJogSpeed();
 $('#m-port').addEventListener('change', e => { dev().port = e.target.value; saveSettings(); });
 $('#m-baud').addEventListener('change', e => { dev().baud = e.target.value; saveSettings(); });
 $('#m-step').addEventListener('change', e => { settings.jogStep = e.target.value; saveSettings(); });
-$('#m-jogf').addEventListener('change', e => { settings.jogF = +e.target.value || 3000; saveSettings(); });
+$('#m-jogf').addEventListener('change', e => { const v = +e.target.value; settings.jogF = v > 0 ? Math.round(readSpeed(v) * 600) / 10 : 3000; saveSettings(); showJogSpeed(); });
 $('#m-connect').addEventListener('click', guard(async () => {
   if (S.m.connected) return machine.disconnect();
   dev().port = $('#m-port').value; saveSettings();
@@ -3814,14 +3839,14 @@ $$('[data-jog]').forEach(b => b.addEventListener('click', guard(async () => {
     const d = dev(), H = d.bedH * rotaryScale(d);
     return machine.ruida('goto', { x: clamp(S.m.wpos[0] + dx, 0, d.bedW), y: clamp(S.m.wpos[1] + dy, 0, H) });
   }
-  await machine.send(C().jog(dx, dy, +$('#m-jogf').value || 3000));
+  await machine.send(C().jog(dx, dy, jogF()));
 })));
 $('#m-home').addEventListener('click', guard(() => isRuida() ? machine.ruida('home') : machine.send(C().home)));
 $('#m-unlock').addEventListener('click', guard(() => machine.send(C().unlock)));
 $('#m-setorigin').addEventListener('click', guard(() => machine.send(C().setOrigin)));
 $('#m-goorigin').addEventListener('click', guard(() => machine.send(C().goOrigin)));
 $('#m-gosel').addEventListener('click', () => gotoSelection());
-$$('[data-jogz]').forEach(b => b.addEventListener('click', guard(() => machine.send(C().jogZ(+b.dataset.jogz * Math.min(10, +$('#m-step').value), Math.min(1000, +$('#m-jogf').value || 600))))));
+$$('[data-jogz]').forEach(b => b.addEventListener('click', guard(() => machine.send(C().jogZ(+b.dataset.jogz * Math.min(10, +$('#m-step').value), Math.min(1000, jogF()))))));
 $('#m-zeroz').addEventListener('click', guard(async () => {
   if (await confirmDialog('Set Z zero here?', 'The current height becomes Z0 — this should be the top of the material (touch the bit on it first).', 'Set Z0')) await machine.send(C().zeroZ);
 }));
@@ -3907,7 +3932,7 @@ function frameCode(withBeam) {
   const opts = jobOpts();
   checkStart();
   const pts = jobFrame(docData(), dev(), opts, $('#j-rubber').checked);
-  return frameGcode(dev(), pts, withBeam ? settings.framePower : 0, +$('#m-jogf').value || 3000);
+  return frameGcode(dev(), pts, withBeam ? settings.framePower : 0, jogF());
 }
 $('#j-frame').addEventListener('click', guard(async () => {
   if (!isRuida()) return machine.send(frameCode(false));

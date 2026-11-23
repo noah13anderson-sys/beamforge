@@ -123,6 +123,10 @@ Edit nodes: D delete point, B break, I insert point under the pointer. Drawing a
 
 **Import / export** — SVG (including pictures embedded in SVG files, ready to trace), DXF, HPGL/PLT, PNG/JPG/BMP/GIF/WebP; export SVG, DXF, G-code, Ruida RD files.
 
+**Speed units** — Edit → Preferences → Speed units shows and takes every speed in mm/s (the default) or mm/min: layer
+speeds, travel, jog and frame speed, material presets and tests, and CNC feed and plunge rates. Only the GRBL `$$`
+editor keeps the controller's own mm/min.
+
 **Cut layers** — Line, Fill, Offset fill, Image; speed, power, passes, air assist, output on/off, run order,
 constant-power override, Z offset/step per pass. Line: kerf compensation, tabs, perforation, holes before outlines.
 Fill: interval, overscan, bi-directional, angle, cross-hatch, one-shape-at-a-time. Image: Floyd–Steinberg, Jarvis,
